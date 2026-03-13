@@ -529,7 +529,8 @@ export const RUBY_QUERIES = `
   name: (constant) @heritage.class
   superclass: (superclass
     (constant) @heritage.extends)) @heritage
-    
+`;
+
 // Kotlin queries - works with tree-sitter-kotlin (fwcd/tree-sitter-kotlin)
 // Based on official tags.scm; functions use simple_identifier, classes use type_identifier
 export const KOTLIN_QUERIES = `
