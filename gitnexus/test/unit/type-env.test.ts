@@ -2748,4 +2748,101 @@ func process() {
       expect(flatGet(env, 'user')).toBeUndefined();
     });
   });
+
+  describe('for-loop element type inference (Tier 1c) — Rust', () => {
+    it('infers loop variable from Vec<User> parameter (for user in &users)', () => {
+      const tree = parse(`
+fn process(users: Vec<User>) {
+    for user in &users {
+        user.save();
+    }
+}
+      `, Rust);
+      const { env } = buildTypeEnv(tree, 'rust');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('infers loop variable from &[User] slice parameter', () => {
+      const tree = parse(`
+fn process(users: &[User]) {
+    for user in users {
+        user.save();
+    }
+}
+      `, Rust);
+      const { env } = buildTypeEnv(tree, 'rust');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('does not infer type for range expression (0..10)', () => {
+      const tree = parse(`
+fn process() {
+    for i in 0..10 {
+        println!("{}", i);
+    }
+}
+      `, Rust);
+      const { env } = buildTypeEnv(tree, 'rust');
+      expect(flatGet(env, 'i')).toBeUndefined();
+    });
+
+    it('does not infer type when iterable has no annotation', () => {
+      const tree = parse(`
+fn process() {
+    let users = get_users();
+    for user in &users {
+        user.save();
+    }
+}
+      `, Rust);
+      const { env } = buildTypeEnv(tree, 'rust');
+      expect(flatGet(env, 'user')).toBeUndefined();
+    });
+  });
+
+  describe('for-loop element type inference (Tier 1c) — C#', () => {
+    it('infers loop variable from var foreach with List<User> parameter', () => {
+      const tree = parse(`
+using System.Collections.Generic;
+class Foo {
+  void Process(List<User> users) {
+    foreach (var user in users) {
+      user.Save();
+    }
+  }
+}
+      `, CSharp);
+      const { env } = buildTypeEnv(tree, 'csharp');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('still resolves explicit type foreach (regression)', () => {
+      const tree = parse(`
+class Foo {
+  void Process(List<User> users) {
+    foreach (User user in users) {
+      user.Save();
+    }
+  }
+}
+      `, CSharp);
+      const { env } = buildTypeEnv(tree, 'csharp');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('does not infer type when iterable has no annotation', () => {
+      const tree = parse(`
+class Foo {
+  void Process() {
+    var users = GetUsers();
+    foreach (var user in users) {
+      user.Save();
+    }
+  }
+}
+      `, CSharp);
+      const { env } = buildTypeEnv(tree, 'csharp');
+      expect(flatGet(env, 'user')).toBeUndefined();
+    });
+  });
 });

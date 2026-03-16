@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
 import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor, PatternBindingExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait } from './shared.js';
+import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'local_declaration_statement',
@@ -131,22 +131,84 @@ const FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set([
   'foreach_statement',
 ]);
 
-/** C#: foreach (User user in users) — extract loop variable binding */
+/** Extract element type from a C# type annotation AST node.
+ *  Handles generic_name (List<User>), array_type (User[]), nullable_type (?). */
+const extractCSharpElementTypeFromTypeNode = (typeNode: SyntaxNode): string | undefined => {
+  // generic_name: List<User>, IEnumerable<User> — C# uses generic_name (not generic_type)
+  if (typeNode.type === 'generic_name') {
+    const argList = findChildByType(typeNode, 'type_argument_list');
+    if (argList && argList.namedChildCount >= 1) {
+      const firstArg = argList.namedChild(0);
+      if (firstArg) return extractSimpleTypeName(firstArg);
+    }
+  }
+  // array_type: User[]
+  if (typeNode.type === 'array_type') {
+    const elemNode = typeNode.firstNamedChild;
+    if (elemNode) return extractSimpleTypeName(elemNode);
+  }
+  // nullable_type: unwrap and recurse (List<User>? → List<User> → User)
+  if (typeNode.type === 'nullable_type') {
+    const inner = typeNode.firstNamedChild;
+    if (inner) return extractCSharpElementTypeFromTypeNode(inner);
+  }
+  return undefined;
+};
+
+/** Walk up from a foreach to the enclosing method and search parameters. */
+const findCSharpParamElementType = (iterableName: string, startNode: SyntaxNode): string | undefined => {
+  let current: SyntaxNode | null = startNode.parent;
+  while (current) {
+    if (current.type === 'method_declaration' || current.type === 'local_function_statement') {
+      const paramsNode = current.childForFieldName('parameters');
+      if (paramsNode) {
+        for (let i = 0; i < paramsNode.namedChildCount; i++) {
+          const param = paramsNode.namedChild(i);
+          if (!param || param.type !== 'parameter') continue;
+          const nameNode = param.childForFieldName('name');
+          if (nameNode?.text !== iterableName) continue;
+          const typeNode = param.childForFieldName('type');
+          if (typeNode) return extractCSharpElementTypeFromTypeNode(typeNode);
+        }
+      }
+      break;
+    }
+    current = current.parent;
+  }
+  return undefined;
+};
+
+/** C#: foreach (User user in users) — extract loop variable binding.
+ *  Tier 1c: for `foreach (var user in users)`, resolves element type from iterable. */
 const extractForLoopBinding: ForLoopExtractor = (
   node: SyntaxNode,
   scopeEnv: Map<string, string>,
-  _declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  _scope: string,
+  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
+  scope: string,
 ): void => {
   const typeNode = node.childForFieldName('type');
-  // The loop variable name is in the 'left' field in tree-sitter-c-sharp
   const nameNode = node.childForFieldName('left');
   if (!typeNode || !nameNode) return;
-  // Skip 'var' — type would need to be inferred from the collection element type
-  if (typeNode.type === 'implicit_type' && typeNode.text === 'var') return;
-  const typeName = extractSimpleTypeName(typeNode);
   const varName = extractVarName(nameNode);
-  if (typeName && varName) scopeEnv.set(varName, typeName);
+  if (!varName) return;
+
+  // Explicit type (existing behavior): foreach (User user in users)
+  if (!(typeNode.type === 'implicit_type' && typeNode.text === 'var')) {
+    const typeName = extractSimpleTypeName(typeNode);
+    if (typeName) scopeEnv.set(varName, typeName);
+    return;
+  }
+
+  // Tier 1c: implicit type (var) — resolve from iterable's container type
+  const rightNode = node.childForFieldName('right');
+  if (!rightNode || rightNode.type !== 'identifier') return;
+  const iterableName = rightNode.text;
+
+  const elementType = resolveIterableElementType(
+    iterableName, node, scopeEnv, declarationTypeNodes, scope,
+    extractCSharpElementTypeFromTypeNode, findCSharpParamElementType,
+  );
+  if (elementType) scopeEnv.set(varName, elementType);
 };
 
 /**

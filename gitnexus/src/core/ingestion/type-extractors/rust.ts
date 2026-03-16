@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, PatternBindingExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractGenericTypeArgs } from './shared.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, PatternBindingExtractor, ForLoopExtractor } from './types.js';
+import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'let_declaration',
@@ -269,13 +269,113 @@ const extractPatternBinding: PatternBindingExtractor = (
   return { varName: innerVar, typeName: typeArgs[argIndex] };
 };
 
+// --- For-loop Tier 1c ---
+
+const FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set(['for_expression']);
+
+/** Extract element type from a Rust type annotation AST node.
+ *  Handles: generic_type (Vec<User>), reference_type (&[User]), array_type ([User; N]),
+ *  slice_type ([User]). For call-graph purposes, strips references (&User → User). */
+const extractRustElementTypeFromTypeNode = (typeNode: SyntaxNode): string | undefined => {
+  // generic_type: Vec<User>, HashSet<User> — extract first type argument
+  if (typeNode.type === 'generic_type') {
+    const args = extractGenericTypeArgs(typeNode);
+    if (args.length >= 1) return args[0];
+  }
+  // reference_type: &[User] or &Vec<User> — unwrap the reference and recurse
+  if (typeNode.type === 'reference_type') {
+    const inner = typeNode.lastNamedChild;
+    if (inner) return extractRustElementTypeFromTypeNode(inner);
+  }
+  // array_type: [User; N] — element is the first child
+  if (typeNode.type === 'array_type') {
+    const elemNode = typeNode.firstNamedChild;
+    if (elemNode) return extractSimpleTypeName(elemNode);
+  }
+  // slice_type: [User] — element is the first child
+  if (typeNode.type === 'slice_type') {
+    const elemNode = typeNode.firstNamedChild;
+    if (elemNode) return extractSimpleTypeName(elemNode);
+  }
+  return undefined;
+};
+
+/** Walk up from a for-loop to the enclosing function_item and search parameters
+ *  for one named `iterableName`. Returns the element type from its annotation. */
+const findRustParamElementType = (iterableName: string, startNode: SyntaxNode): string | undefined => {
+  let current: SyntaxNode | null = startNode.parent;
+  while (current) {
+    if (current.type === 'function_item') {
+      const paramsNode = current.childForFieldName('parameters');
+      if (paramsNode) {
+        for (let i = 0; i < paramsNode.namedChildCount; i++) {
+          const param = paramsNode.namedChild(i);
+          if (!param || param.type !== 'parameter') continue;
+          const nameNode = param.childForFieldName('pattern');
+          if (!nameNode) continue;
+          // Unwrap reference patterns: &users, &mut users
+          let identNode = nameNode;
+          if (identNode.type === 'reference_pattern') {
+            identNode = identNode.lastNamedChild ?? identNode;
+          }
+          if (identNode.type === 'mut_pattern') {
+            identNode = identNode.firstNamedChild ?? identNode;
+          }
+          if (identNode.text !== iterableName) continue;
+          const typeNode = param.childForFieldName('type');
+          if (typeNode) return extractRustElementTypeFromTypeNode(typeNode);
+        }
+      }
+      break;
+    }
+    current = current.parent;
+  }
+  return undefined;
+};
+
+/** Rust: for user in &users where users has a known container type.
+ *  Unwraps reference_expression (&users, &mut users) to get the iterable name. */
+const extractForLoopBinding: ForLoopExtractor = (
+  node: SyntaxNode,
+  scopeEnv: Map<string, string>,
+  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
+  scope: string,
+): void => {
+  if (node.type !== 'for_expression') return;
+
+  const patternNode = node.childForFieldName('pattern');
+  const valueNode = node.childForFieldName('value');
+  if (!patternNode || !valueNode) return;
+
+  // Extract iterable name — may be &users, &mut users, or plain users
+  let iterableName: string | undefined;
+  if (valueNode.type === 'reference_expression') {
+    const inner = valueNode.lastNamedChild;
+    if (inner?.type === 'identifier') iterableName = inner.text;
+  } else if (valueNode.type === 'identifier') {
+    iterableName = valueNode.text;
+  }
+  if (!iterableName) return;
+
+  const elementType = resolveIterableElementType(
+    iterableName, node, scopeEnv, declarationTypeNodes, scope,
+    extractRustElementTypeFromTypeNode, findRustParamElementType,
+  );
+  if (!elementType) return;
+
+  const loopVarName = extractVarName(patternNode);
+  if (loopVarName) scopeEnv.set(loopVarName, elementType);
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
+  forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
   patternBindingNodeTypes: new Set(['let_condition']),
   extractDeclaration,
   extractInitializer,
   extractParameter,
   scanConstructorBinding,
+  extractForLoopBinding,
   extractPendingAssignment,
   extractPatternBinding,
 };
