@@ -1,31 +1,15 @@
 import type { SyntaxNode } from '../utils.js';
-import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor } from './types.js';
+import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor, PatternBindingExtractor } from './types.js';
 import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'local_declaration_statement',
   'variable_declaration',
   'field_declaration',
-  'is_pattern_expression',
 ]);
 
-/** C#: Type x = ...; var x = new Type(); obj is Type x */
+/** C#: Type x = ...; var x = new Type(); */
 const extractDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: Map<string, string>): void => {
-  // C# pattern matching: `obj is User user` → is_pattern_expression > declaration_pattern
-  if (node.type === 'is_pattern_expression') {
-    const pattern = node.childForFieldName('pattern');
-    if (pattern?.type === 'declaration_pattern') {
-      const typeNode = pattern.childForFieldName('type');
-      const nameNode = pattern.childForFieldName('name');
-      if (typeNode && nameNode) {
-        const typeName = extractSimpleTypeName(typeNode);
-        const varName = extractVarName(nameNode);
-        if (typeName && varName) env.set(varName, typeName);
-      }
-    }
-    return;
-  }
-
   // C# tree-sitter: local_declaration_statement > variable_declaration > ...
   // Recursively descend through wrapper nodes
   for (let i = 0; i < node.namedChildCount; i++) {
@@ -160,6 +144,33 @@ const extractForLoopBinding: ForLoopExtractor = (node: SyntaxNode, scopeEnv: Map
   if (typeName && varName) scopeEnv.set(varName, typeName);
 };
 
+/**
+ * C# pattern binding extractor for `obj is Type variable` (type pattern).
+ *
+ * AST structure:
+ *   is_pattern_expression
+ *     expression: (the variable being tested)
+ *     pattern: declaration_pattern
+ *       type: (the declared type)
+ *       name: single_variable_designation > identifier (the new variable name)
+ *
+ * Conservative: returns undefined when the pattern field is absent, is not a
+ * declaration_pattern, or when the type/name cannot be extracted.
+ * No scopeEnv lookup is needed — the pattern explicitly declares the new variable's type.
+ */
+const extractPatternBinding: PatternBindingExtractor = (node) => {
+  if (node.type !== 'is_pattern_expression') return undefined;
+  const pattern = node.childForFieldName('pattern');
+  if (pattern?.type !== 'declaration_pattern') return undefined;
+  const typeNode = pattern.childForFieldName('type');
+  const nameNode = pattern.childForFieldName('name');
+  if (!typeNode || !nameNode) return undefined;
+  const typeName = extractSimpleTypeName(typeNode);
+  const varName = extractVarName(nameNode);
+  if (!typeName || !varName) return undefined;
+  return { varName, typeName };
+};
+
 /** C#: var alias = u → variable_declarator with name + equals_value_clause.
  *  Only local_declaration_statement and variable_declaration contain variable_declarator children;
  *  is_pattern_expression and field_declaration never do — skip them early. */
@@ -193,4 +204,5 @@ export const typeConfig: LanguageTypeConfig = {
   scanConstructorBinding,
   extractForLoopBinding,
   extractPendingAssignment,
+  extractPatternBinding,
 };

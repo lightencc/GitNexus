@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName } from './shared.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, PatternBindingExtractor, ForLoopExtractor } from './types.js';
+import { extractSimpleTypeName, extractVarName, extractElementTypeFromString, extractGenericTypeArgs } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'assignment',
@@ -134,6 +134,127 @@ const scanConstructorBinding: ConstructorBindingScanner = (node) => {
   return { varName: left.text, calleeName };
 };
 
+const FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set([
+  'for_statement',
+]);
+
+/** Python function/method node types that carry a parameters list. */
+const PY_FUNCTION_NODE_TYPES = new Set([
+  'function_definition', 'decorated_definition',
+]);
+
+/**
+ * Extract element type from a Python type annotation AST node.
+ * Handles:
+ *   subscript "List[User]"  →  extractElementTypeFromString("List[User]") → "User"
+ *   generic_type            →  extractGenericTypeArgs → first arg
+ * Falls back to text-based extraction.
+ */
+const extractPyElementTypeFromAnnotation = (typeNode: SyntaxNode): string | undefined => {
+  // Python subscript: List[User], Sequence[User] — use raw text
+  if (typeNode.type === 'subscript') {
+    return extractElementTypeFromString(typeNode.text);
+  }
+  // generic_type (less common in Python but present in some grammars)
+  if (typeNode.type === 'generic_type') {
+    const args = extractGenericTypeArgs(typeNode);
+    if (args.length >= 1) return args[0];
+  }
+  // Fallback: raw text extraction (handles User[], [User], etc.)
+  return extractElementTypeFromString(typeNode.text);
+};
+
+/**
+ * Walk up the AST from a for-statement to find the enclosing function definition,
+ * then search its parameters for one named `iterableName`.
+ * Returns the element type extracted from its type annotation, or undefined.
+ *
+ * Handles both `parameter` and `typed_parameter` node types in tree-sitter-python.
+ * `typed_parameter` may not expose the name as a `name` field — falls back to
+ * checking the first identifier-type named child.
+ */
+const findPyParamElementType = (iterableName: string, startNode: SyntaxNode): string | undefined => {
+  let current: SyntaxNode | null = startNode.parent;
+  while (current) {
+    if (current.type === 'function_definition') {
+      const paramsNode = current.childForFieldName('parameters');
+      if (paramsNode) {
+        for (let i = 0; i < paramsNode.namedChildCount; i++) {
+          const param = paramsNode.namedChild(i);
+          if (!param) continue;
+          // Try named `name` field first (parameter node), then first identifier child
+          // (typed_parameter node may store name as first positional child)
+          const nameNode = param.childForFieldName('name')
+            ?? (param.firstNamedChild?.type === 'identifier' ? param.firstNamedChild : null);
+          if (nameNode?.text !== iterableName) continue;
+          // Try `type` field, then last named child (typed_parameter stores type last)
+          const typeAnnotation = param.childForFieldName('type')
+            ?? (param.namedChildCount >= 2 ? param.namedChild(param.namedChildCount - 1) : null);
+          if (typeAnnotation && typeAnnotation !== nameNode) {
+            return extractPyElementTypeFromAnnotation(typeAnnotation);
+          }
+        }
+      }
+      break;
+    }
+    current = current.parent;
+  }
+  return undefined;
+};
+
+/**
+ * Python: for user in users: where users has a known container type annotation.
+ *
+ * AST node: `for_statement` with `left` (loop variable) and `right` (iterable).
+ *
+ * Tier 1c: resolves the element type via three strategies in priority order:
+ *   1. declarationTypeNodes — raw type annotation AST node (covers stored container types)
+ *   2. scopeEnv string — extractElementTypeFromString on the stored type
+ *   3. AST walk — walks up to the enclosing function's parameters to read List[User] directly
+ */
+const extractForLoopBinding: ForLoopExtractor = (
+  node: SyntaxNode,
+  scopeEnv: Map<string, string>,
+  declarationTypeNodes?: ReadonlyMap<string, SyntaxNode>,
+  scope?: string,
+): void => {
+  if (node.type !== 'for_statement') return;
+
+  // The iterable is the `right` field of the for_statement.
+  const rightNode = node.childForFieldName('right');
+  if (!rightNode || rightNode.type !== 'identifier') return;
+  const iterableName = rightNode.text;
+
+  let elementType: string | undefined;
+
+  // Strategy 1: declarationTypeNodes — raw type annotation node
+  if (!elementType && declarationTypeNodes && scope) {
+    const typeAnnotationNode = declarationTypeNodes.get(`${scope}\0${iterableName}`);
+    if (typeAnnotationNode) {
+      elementType = extractPyElementTypeFromAnnotation(typeAnnotationNode);
+    }
+  }
+
+  // Strategy 2: scopeEnv string — for locally declared vars with container type strings
+  if (!elementType) {
+    const iterableType = scopeEnv.get(iterableName);
+    if (iterableType) elementType = extractElementTypeFromString(iterableType);
+  }
+
+  // Strategy 3: AST walk — for List[User] parameters where extractSimpleTypeName returned undefined
+  if (!elementType) {
+    elementType = findPyParamElementType(iterableName, node);
+  }
+
+  if (!elementType) return;
+
+  // The loop variable is the `left` field — a plain identifier.
+  const leftNode = node.childForFieldName('left');
+  if (!leftNode) return;
+  const loopVarName = extractVarName(leftNode);
+  if (loopVarName) scopeEnv.set(loopVarName, elementType);
+};
+
 /** Python: alias = u → assignment with left/right fields.
  *  Also handles walrus operator: alias := u → named_expression with name/value fields. */
 const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
@@ -157,11 +278,78 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   return undefined;
 };
 
+/**
+ * Python match/case `as` pattern binding: `case User() as u:`
+ *
+ * AST structure (tree-sitter-python):
+ *   as_pattern
+ *     alias: as_pattern_target   ← the bound variable name (e.g. "u")
+ *     children[0]: case_pattern  ← wraps class_pattern (or is class_pattern directly)
+ *       class_pattern
+ *         dotted_name            ← the class name (e.g. "User")
+ *
+ * The `alias` field is an `as_pattern_target` node whose `.text` is the identifier.
+ * The class name lives in the first non-alias named child: either a `case_pattern`
+ * wrapping a `class_pattern`, or a direct `class_pattern`.
+ *
+ * Conservative: returns undefined when:
+ * - The node is not an `as_pattern`
+ * - The pattern side is not a class_pattern (e.g. guard or literal match)
+ * - The variable was already bound in scopeEnv
+ */
+const extractPatternBinding: PatternBindingExtractor = (node, scopeEnv) => {
+  if (node.type !== 'as_pattern') return undefined;
+
+  // as_pattern children (positional, no named fields in this tree-sitter version):
+  //   child 0: case_pattern (wrapping class_pattern) or class_pattern directly
+  //   child 1: identifier (the bound variable name, e.g. "u")
+  // Note: `alias` field returns null at runtime despite node-types.json listing it.
+  if (node.namedChildCount < 2) return undefined;
+
+  const patternChild = node.namedChild(0);
+  const varNameNode = node.namedChild(node.namedChildCount - 1);
+  if (!patternChild || !varNameNode) return undefined;
+  if (varNameNode.type !== 'identifier') return undefined;
+
+  const varName = varNameNode.text;
+  if (!varName || scopeEnv.has(varName)) return undefined;
+
+  // Find the class_pattern — may be direct or wrapped in case_pattern.
+  let classPattern: SyntaxNode | null = null;
+  if (patternChild.type === 'class_pattern') {
+    classPattern = patternChild;
+  } else if (patternChild.type === 'case_pattern') {
+    // Unwrap one level: case_pattern wraps class_pattern
+    for (let j = 0; j < patternChild.namedChildCount; j++) {
+      const inner = patternChild.namedChild(j);
+      if (inner?.type === 'class_pattern') {
+        classPattern = inner;
+        break;
+      }
+    }
+  }
+  if (!classPattern) return undefined;
+
+  // class_pattern children: dotted_name (the class name) + optional keyword_pattern args.
+  const classNameNode = classPattern.firstNamedChild;
+  if (!classNameNode || (classNameNode.type !== 'dotted_name' && classNameNode.type !== 'identifier')) return undefined;
+  const typeName = classNameNode.text;
+  if (!typeName) return undefined;
+
+  return { varName, typeName };
+};
+
+const PATTERN_BINDING_NODE_TYPES: ReadonlySet<string> = new Set(['as_pattern']);
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
+  forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
   extractDeclaration,
   extractParameter,
   extractInitializer,
   scanConstructorBinding,
+  extractForLoopBinding,
   extractPendingAssignment,
+  extractPatternBinding,
+  patternBindingNodeTypes: PATTERN_BINDING_NODE_TYPES,
 };

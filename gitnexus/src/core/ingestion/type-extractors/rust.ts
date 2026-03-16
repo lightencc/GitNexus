@@ -277,4 +277,5 @@ export const typeConfig: LanguageTypeConfig = {
   scanConstructorBinding,
   extractPendingAssignment,
   extractPatternBinding,
+  patternBindingNodeTypes: new Set(['let_condition']),
 };

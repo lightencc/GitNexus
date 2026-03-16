@@ -796,3 +796,52 @@ describe('Go assignment chain propagation', () => {
     expect(userSaves.length).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Chained method calls: svc.GetUser().Save()
+// Tests that Go chain call resolution correctly infers the intermediate
+// receiver type from GetUser()'s return type and resolves Save() to User.
+// ---------------------------------------------------------------------------
+
+describe('Go chained method call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-chain-call'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, Repo structs and UserService', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    expect(getNodesByLabel(result, 'Struct')).toContain('UserService');
+  });
+
+  it('detects GetUser and Save symbols', () => {
+    const allSymbols = [...getNodesByLabel(result, 'Function'), ...getNodesByLabel(result, 'Method')];
+    expect(allSymbols).toContain('GetUser');
+    expect(allSymbols).toContain('Save');
+  });
+
+  it('resolves svc.GetUser().Save() to User#Save via chain resolution', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath?.includes('user.go'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve svc.GetUser().Save() to Repo#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'Save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath?.includes('repo.go'),
+    );
+    expect(repoSave).toBeUndefined();
+  });
+});

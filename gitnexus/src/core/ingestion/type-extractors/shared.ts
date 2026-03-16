@@ -316,3 +316,104 @@ export const findChildByType = (node: SyntaxNode, type: string): SyntaxNode | nu
   }
   return null;
 };
+
+// Internal helper: extract the first comma-separated argument from a string,
+// respecting nested angle-bracket and square-bracket depth.
+function extractFirstArg(args: string): string {
+  let depth = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i];
+    if (ch === '<' || ch === '[') depth++;
+    else if (ch === '>' || ch === ']') depth--;
+    else if (ch === ',' && depth === 0) return args.slice(0, i).trim();
+  }
+  return args.trim();
+}
+
+/**
+ * Extract element type from a container type string.
+ * Uses bracket-balanced parsing (no regex) for generic argument extraction.
+ * Returns undefined for ambiguous or unparseable strings.
+ *
+ * Handles:
+ * - Array<User>    → User  (generic angle brackets)
+ * - User[]         → User  (array suffix)
+ * - []User         → User  (Go slice prefix)
+ * - List[User]     → User  (Python subscript)
+ * - [User]         → User  (Swift array sugar)
+ * - vector<User>   → User  (C++ container)
+ * - Vec<User>      → User  (Rust container)
+ *
+ * For multi-argument generics (Map<K, V>), only the first type argument is
+ * returned. Returns undefined when the extracted type is not a simple word
+ * (e.g., nested generics as element types).
+ */
+export function extractElementTypeFromString(typeStr: string): string | undefined {
+  if (!typeStr || typeStr.length === 0) return undefined;
+
+  // 1. Array suffix: User[] → User
+  if (typeStr.endsWith('[]')) {
+    const base = typeStr.slice(0, -2).trim();
+    return base && /^\w+$/.test(base) ? base : undefined;
+  }
+
+  // 2. Go slice prefix: []User → User
+  if (typeStr.startsWith('[]')) {
+    const element = typeStr.slice(2).trim();
+    return element && /^\w+$/.test(element) ? element : undefined;
+  }
+
+  // 3. Swift array sugar: [User] → User
+  //    Must start with '[', end with ']', and contain no angle brackets
+  //    (to avoid confusing with List[User] handled below).
+  if (typeStr.startsWith('[') && typeStr.endsWith(']') && !typeStr.includes('<')) {
+    const element = typeStr.slice(1, -1).trim();
+    return element && /^\w+$/.test(element) ? element : undefined;
+  }
+
+  // 4. Generic bracket-balanced extraction: Array<User> / List[User] / Vec<User>
+  //    Find the first opening bracket (< or [) and pick the one that appears first.
+  const openAngle = typeStr.indexOf('<');
+  const openSquare = typeStr.indexOf('[');
+
+  let openIdx = -1;
+  let openChar = '';
+  let closeChar = '';
+
+  if (openAngle >= 0 && (openSquare < 0 || openAngle < openSquare)) {
+    openIdx = openAngle;
+    openChar = '<';
+    closeChar = '>';
+  } else if (openSquare >= 0) {
+    openIdx = openSquare;
+    openChar = '[';
+    closeChar = ']';
+  }
+
+  if (openIdx < 0) return undefined;
+
+  // Walk bracket-balanced from the character after the opening bracket to find
+  // the matching close bracket, tracking depth for nested brackets.
+  let depth = 0;
+  const start = openIdx + 1;
+  for (let i = start; i < typeStr.length; i++) {
+    const ch = typeStr[i];
+    if (ch === openChar || ch === '<' || ch === '[') {
+      depth++;
+    } else if (ch === closeChar || ch === '>' || ch === ']') {
+      if (depth === 0) {
+        // Found the matching close bracket — extract and validate first arg.
+        const inner = typeStr.slice(start, i).trim();
+        const firstArg = extractFirstArg(inner);
+        return firstArg && /^\w+$/.test(firstArg) ? firstArg : undefined;
+      }
+      depth--;
+    } else if (ch === ',' && depth === 0) {
+      // Top-level comma before the matching close bracket — take the text before it.
+      const arg = typeStr.slice(start, i).trim();
+      return arg && /^\w+$/.test(arg) ? arg : undefined;
+    }
+  }
+
+  return undefined;
+}

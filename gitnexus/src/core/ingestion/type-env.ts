@@ -330,7 +330,7 @@ export const buildTypeEnv = (
     // For-each loop variable bindings (Java/C#/Kotlin): explicit element types in the AST.
     // Checked before declarationNodeTypes — loop variables are not declarations.
     if (config.forLoopNodeTypes?.has(node.type)) {
-      config.extractForLoopBinding?.(node, scopeEnv);
+      config.extractForLoopBinding?.(node, scopeEnv, declarationTypeNodes, scope);
       return;
     }
     if (config.declarationNodeTypes.has(node.type)) {
@@ -385,7 +385,7 @@ export const buildTypeEnv = (
     // via pattern matching (e.g. `if let Some(x) = opt`, `x instanceof T t`).
     // Runs after Tier 0/1 so scopeEnv already contains the source variable's type.
     // Conservative: extractor returns undefined when source type is unknown.
-    if (config.extractPatternBinding) {
+    if (config.extractPatternBinding && (!config.patternBindingNodeTypes || config.patternBindingNodeTypes.has(node.type))) {
       const patternBinding = config.extractPatternBinding(node, scopeEnv, declarationTypeNodes, scope);
       if (patternBinding && !scopeEnv.has(patternBinding.varName)) {
         scopeEnv.set(patternBinding.varName, patternBinding.typeName);

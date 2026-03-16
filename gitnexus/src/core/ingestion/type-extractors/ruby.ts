@@ -1,4 +1,4 @@
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ReturnTypeExtractor } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ReturnTypeExtractor, PendingAssignmentExtractor } from './types.js';
 import { extractRubyConstructorAssignment, extractSimpleTypeName } from './shared.js';
 import type { SyntaxNode } from '../utils.js';
 
@@ -261,6 +261,22 @@ const scanConstructorBinding: ConstructorBindingScanner = (node) => {
   return { varName: left.text, calleeName };
 };
 
+/**
+ * Ruby: alias_user = user → assignment with left/right identifier fields.
+ * Only handles plain identifier RHS (not calls, not literals).
+ * Skips if LHS already has a resolved type in scopeEnv.
+ */
+const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
+  if (node.type !== 'assignment') return undefined;
+  const lhsNode = node.childForFieldName('left');
+  if (!lhsNode || lhsNode.type !== 'identifier') return undefined;
+  const varName = lhsNode.text;
+  if (scopeEnv.has(varName)) return undefined;
+  const rhsNode = node.childForFieldName('right');
+  if (!rhsNode || rhsNode.type !== 'identifier') return undefined;
+  return { lhs: varName, rhs: rhsNode.text };
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   extractDeclaration,
@@ -268,4 +284,5 @@ export const typeConfig: LanguageTypeConfig = {
   extractInitializer,
   scanConstructorBinding,
   extractReturnType,
+  extractPendingAssignment,
 };

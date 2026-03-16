@@ -151,6 +151,7 @@ export const javaTypeConfig: LanguageTypeConfig = {
   extractForLoopBinding: extractJavaForLoopBinding,
   extractPendingAssignment: extractJavaPendingAssignment,
   extractPatternBinding: extractJavaPatternBinding,
+  patternBindingNodeTypes: new Set(['instanceof_expression']),
 };
 
 // ── Kotlin ────────────────────────────────────────────────────────────────

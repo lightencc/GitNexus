@@ -1020,3 +1020,52 @@ describe('Rust if-let Err(e) pattern binding (Phase 5 review fix)', () => {
     expect(wrongCall).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Chained method calls: svc.get_user().save()
+// Tests that Rust chain call resolution correctly infers the intermediate
+// receiver type from get_user()'s return type and resolves save() to User.
+// ---------------------------------------------------------------------------
+
+describe('Rust chained method call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-chain-call'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs, and UserService', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    expect(getNodesByLabel(result, 'Struct')).toContain('UserService');
+  });
+
+  it('detects get_user and save functions', () => {
+    const fns = getNodesByLabel(result, 'Function');
+    expect(fns).toContain('get_user');
+    expect(fns).toContain('save');
+  });
+
+  it('resolves svc.get_user().save() to User#save via chain resolution', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process_user' &&
+      c.targetFilePath?.includes('user.rs'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve svc.get_user().save() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process_user' &&
+      c.targetFilePath?.includes('repo.rs'),
+    );
+    expect(repoSave).toBeUndefined();
+  });
+});

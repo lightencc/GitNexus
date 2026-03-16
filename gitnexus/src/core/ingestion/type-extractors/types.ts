@@ -28,6 +28,8 @@ export type ReturnTypeExtractor = (node: SyntaxNode) => string | undefined;
 export type ForLoopExtractor = (
   node: SyntaxNode,
   scopeEnv: Map<string, string>,
+  declarationTypeNodes?: ReadonlyMap<string, SyntaxNode>,
+  scope?: string,
 ) => void;
 
 /** Extracts a plain-identifier assignment for Tier 2 propagation.
@@ -89,4 +91,9 @@ export interface LanguageTypeConfig {
    *  The extractor receives the current scope's resolved bindings (read-only) to look up the
    *  source variable's type. Returns undefined for non-matching nodes or unknown source types. */
   extractPatternBinding?: PatternBindingExtractor;
+  /** Optional allowlist of AST node types on which extractPatternBinding should run.
+   *  When present, extractPatternBinding is only invoked for nodes whose type is in this set,
+   *  short-circuiting the call for all other node types. When absent, every node is passed to
+   *  extractPatternBinding (legacy behaviour). */
+  patternBindingNodeTypes?: ReadonlySet<string>;
 }

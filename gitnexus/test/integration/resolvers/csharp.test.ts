@@ -932,3 +932,53 @@ describe('C# is-pattern type binding disambiguation (Phase 5.2)', () => {
     expect(repoSave).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Chained method calls: svc.GetUser().Save()
+// Tests that C# chain call resolution correctly infers the intermediate
+// receiver type from GetUser()'s return type and resolves Save() to User.
+// ---------------------------------------------------------------------------
+
+describe('C# chained method call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-chain-call'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, Repo, and UserService classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Repo');
+    expect(classes).toContain('UserService');
+  });
+
+  it('detects GetUser and Save methods', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('GetUser');
+    expect(methods).toContain('Save');
+  });
+
+  it('resolves svc.GetUser().Save() to User#Save via chain resolution', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' &&
+      c.source === 'ProcessUser' &&
+      c.targetFilePath?.includes('User.cs'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve svc.GetUser().Save() to Repo#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'Save' &&
+      c.source === 'ProcessUser' &&
+      c.targetFilePath?.includes('Repo.cs'),
+    );
+    expect(repoSave).toBeUndefined();
+  });
+});

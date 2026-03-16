@@ -650,3 +650,56 @@ describe('C++ assignment chain propagation (auto alias)', () => {
     expect(repoTargeted.length).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Chained method calls: svc.getUser().save()
+// Tests that C++ chain call resolution correctly infers the intermediate
+// receiver type from getUser()'s return type and resolves save() to User.
+// ---------------------------------------------------------------------------
+
+describe('C++ chained method call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-chain-call'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, Repo, and UserService classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Repo');
+    expect(classes).toContain('UserService');
+  });
+
+  it('detects getUser and save symbols', () => {
+    const allSymbols = [
+      ...getNodesByLabel(result, 'Function'),
+      ...getNodesByLabel(result, 'Method'),
+    ];
+    expect(allSymbols).toContain('getUser');
+    expect(allSymbols).toContain('save');
+  });
+
+  it('resolves svc.getUser().save() to User#save via chain resolution', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath?.includes('user.h'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve svc.getUser().save() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath?.includes('repo.h'),
+    );
+    expect(repoSave).toBeUndefined();
+  });
+});
