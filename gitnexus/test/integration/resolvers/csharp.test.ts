@@ -982,3 +982,98 @@ describe('C# chained method call resolution', () => {
     expect(repoSave).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// C# var foreach Tier 1c: foreach (var user in users) with List<User> param
+// ---------------------------------------------------------------------------
+
+describe('C# var foreach type resolution (Tier 1c)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-var-foreach'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with Save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('detects methods on both classes', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods.filter(m => m === 'Save').length).toBe(2);
+    expect(methods).toContain('ProcessUsers');
+    expect(methods).toContain('ProcessRepos');
+  });
+
+  it('resolves direct calls with explicit parameter types (u.Save, r.Save)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const directUserSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'Direct' && c.targetFilePath?.includes('User.cs'),
+    );
+    const directRepoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'Direct' && c.targetFilePath?.includes('Repo.cs'),
+    );
+    expect(directUserSave).toBeDefined();
+    expect(directRepoSave).toBeDefined();
+  });
+
+  it('resolves user.Save() in var foreach to User#Save via Tier 1c', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessUsers' && c.targetFilePath?.includes('User.cs'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.Save() in var foreach to Repo#Save via Tier 1c', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessRepos' && c.targetFilePath?.includes('Repo.cs'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT cross-resolve user.Save() to Repo#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrong = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessUsers' && c.targetFilePath?.includes('Repo.cs'),
+    );
+    expect(wrong).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C# switch pattern: switch (obj) { case User user: user.Save(); }
+// ---------------------------------------------------------------------------
+
+describe('C# switch pattern type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-switch-pattern'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('resolves user.Save() via is-pattern to User#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'Save' && c.targetFilePath === 'Models/User.cs');
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.Save() via switch case pattern to Repo#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'Save' && c.targetFilePath === 'Models/Repo.cs');
+    expect(repoSave).toBeDefined();
+  });
+});

@@ -317,11 +317,12 @@ export const buildTypeEnv = (
   const extractTypeBinding = (node: SyntaxNode, scopeEnv: Map<string, string>, scope: string): void => {
     // This guard eliminates 90%+ of calls before any language dispatch.
     if (TYPED_PARAMETER_TYPES.has(node.type)) {
-      // Capture the raw type annotation BEFORE extractParameter — parameters
-      // consistently expose 'name' and 'type' fields across all languages.
+      // Capture the raw type annotation BEFORE extractParameter.
+      // Most languages use 'name' field; Rust uses 'pattern'; TS uses 'pattern' for some param types.
       const typeNode = node.childForFieldName('type');
       if (typeNode) {
-        const nameNode = node.childForFieldName('name');
+        const nameNode = node.childForFieldName('name')
+          ?? node.childForFieldName('pattern');
         if (nameNode) {
           const varName = extractVarName(nameNode);
           if (varName && !declarationTypeNodes.has(`${scope}\0${varName}`)) {

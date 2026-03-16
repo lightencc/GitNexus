@@ -845,3 +845,42 @@ describe('Go chained method call resolution', () => {
     expect(repoSave).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Go map range: for _, user := range userMap where map[string]User
+// ---------------------------------------------------------------------------
+
+describe('Go map range type resolution (Tier 1c)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-map-range'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs with Save methods in separate files', () => {
+    const structs = getNodesByLabel(result, 'Struct');
+    expect(structs).toContain('User');
+    expect(structs).toContain('Repo');
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods.filter(m => m === 'Save').length).toBe(2);
+  });
+
+  it('resolves user.Save() in map range to User#Save via map_type value', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processMap' && c.targetFilePath?.includes('user.go'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve user.Save() to Repo#Save (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processMap' && c.targetFilePath?.includes('repo.go'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});
