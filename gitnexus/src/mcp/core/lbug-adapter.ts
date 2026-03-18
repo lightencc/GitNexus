@@ -27,6 +27,8 @@ interface PoolEntry {
   waiters: Array<(conn: lbug.Connection) => void>;
   lastUsed: number;
   dbPath: string;
+  /** Set to true when the pool entry is closed — checkin will close orphaned connections */
+  closed: boolean;
 }
 
 const pool = new Map<string, PoolEntry>();
@@ -96,21 +98,35 @@ function evictLRU(): void {
 }
 
 /**
- * Remove a repo from the pool and release its shared Database ref.
- *
- * LadybugDB's native .closeSync() triggers N-API destructor hooks that
- * segfault on Linux/macOS.  Pool databases are opened read-only, so
- * there is no WAL to flush — just deleting the pool entry and letting
- * the GC (or process exit) reclaim native resources is safe.
+ * Remove a repo from the pool, close its connections, and release its
+ * shared Database ref.  Only closes the Database when no other repoIds
+ * reference it (refCount === 0).
  */
 function closeOne(repoId: string): void {
   const entry = pool.get(repoId);
-  if (entry) {
-    const shared = dbCache.get(entry.dbPath);
-    if (shared && shared.refCount > 0) {
-      shared.refCount--;
+  if (!entry) return;
+
+  entry.closed = true;
+
+  // Close available connections (safe — they're not in use)
+  for (const conn of entry.available) {
+    try { conn.close(); } catch {}
+  }
+  entry.available.length = 0;
+
+  // Checked-out connections can't be closed here — they're in-flight.
+  // The checkin() function detects entry.closed and closes them on return.
+
+  // Only close the Database when no other repoIds reference it
+  const shared = dbCache.get(entry.dbPath);
+  if (shared) {
+    shared.refCount--;
+    if (shared.refCount === 0) {
+      try { shared.db.close(); } catch {}
+      dbCache.delete(entry.dbPath);
     }
   }
+
   pool.delete(repoId);
 }
 
@@ -274,7 +290,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
   // Register pool entry only after all connections are pre-warmed and FTS is
   // loaded.  Concurrent executeQuery calls see either "not initialized"
   // (and throw cleanly) or a fully ready pool — never a half-built one.
-  pool.set(repoId, { db, available, checkedOut: 0, waiters: [], lastUsed: Date.now(), dbPath });
+  pool.set(repoId, { db, available, checkedOut: 0, waiters: [], lastUsed: Date.now(), dbPath, closed: false });
   ensureIdleTimer();
 }
 
@@ -319,10 +335,17 @@ function checkout(entry: PoolEntry): Promise<lbug.Connection> {
 
 /**
  * Return a connection to the pool after use.
+ * If the pool entry was closed while the connection was checked out (e.g.
+ * LRU eviction), close the orphaned connection instead of returning it.
  * If there are queued waiters, hand the connection directly to the next one
  * instead of putting it back in the available array (avoids race conditions).
  */
 function checkin(entry: PoolEntry, conn: lbug.Connection): void {
+  if (entry.closed) {
+    // Pool entry was deleted during checkout — close the orphaned connection
+    try { conn.close(); } catch {}
+    return;
+  }
   if (entry.waiters.length > 0) {
     // Hand directly to the next waiter — no intermediate available state
     const waiter = entry.waiters.shift()!;

@@ -5,8 +5,7 @@
  * Each test file clears all data, reseeds, and initializes adapters —
  * avoiding per-file schema creation overhead.
  *
- * Cleanup is intentionally a no-op: CI runs each LadybugDB test file in its
- * own vitest process, so the OS reclaims all native resources on exit.
+ * Cleanup properly closes adapters and releases native resources.
  *
  * Each test file gets a unique repoId to prevent MCP pool map collisions.
  * Seed data is NOT included — each test provides its own via options.seed.
@@ -27,7 +26,7 @@ export interface IndexedDBHandle {
   repoId: string;
   /** Temp directory handle for filesystem cleanup */
   tmpHandle: TestDBHandle;
-  /** Cleanup: detaches adapters (null-out, no native .close()) */
+  /** Cleanup: closes adapters and releases native resources */
   cleanup: () => Promise<void>;
 }
 
@@ -119,25 +118,22 @@ export function withTestLbugDB(
       }
     }
 
-    // 7. Close core adapter (Windows only), then open pool adapter (read-only).
+    // 7. Close core adapter, then open pool adapter (read-only).
     //    On Windows, LadybugDB enforces file locks — writable + read-only
     //    can't coexist on the same path, so we must close the core first.
-    //    On Linux/macOS, .close() deadlocks or segfaults via N-API
-    //    destructor hooks, but concurrent Database instances on the same
-    //    path are allowed, so we skip the close entirely.
     if (options?.poolAdapter) {
-      if (process.platform === 'win32') {
-        await adapter.closeLbug();
-      }
+      await adapter.closeLbug();
       const { initLbug: poolInitLbug } = await import('../../src/mcp/core/lbug-adapter.js');
       await poolInitLbug(repoId, dbPath);
     }
 
-    // Cleanup: intentionally a no-op. We do NOT call detachLbug() here
-    // because .closeSync() segfaults on Linux (LadybugDB N-API destructor bug).
-    // CI runs each LadybugDB test file in its own vitest process, so the OS
-    // reclaims all native resources on process exit — no explicit cleanup needed.
-    const cleanup = async () => {};
+    const cleanup = async () => {
+      if (options?.poolAdapter) {
+        const poolAdapter = await import('../../src/mcp/core/lbug-adapter.js');
+        await poolAdapter.closeLbug(repoId);
+      }
+      await adapter.closeLbug();
+    };
 
     // tmpHandle.dbPath → parent temp dir (not the lbug file) so tests
     // that create sibling directories (e.g. 'storage') still work.

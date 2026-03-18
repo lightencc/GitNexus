@@ -8,9 +8,7 @@ export default defineConfig({
     hookTimeout: 120000,
     pool: 'forks',
     globals: true,
-    setupFiles: ['test/setup.ts'],
     teardownTimeout: 3000,
-    dangerouslyIgnoreUnhandledErrors: true, // LadybugDB N-API destructor segfaults on fork exit — not a test failure
 
     // Coverage stays at root (not supported in project configs)
     coverage: {
