@@ -9,6 +9,12 @@ export default defineConfig({
     pool: 'forks',
     globals: true,
     teardownTimeout: 3000,
+    // N-API destructors can crash worker forks on macOS during process exit.
+    // This is independent of the QueryResult lifetime fix in @ladybugdb/core 0.15.2 —
+    // it's a vitest forks + native addon interaction where destructors run in
+    // arbitrary order at exit. Tests themselves pass; only the exit crashes.
+    // TODO: remove once LadybugDB fixes all N-API destructor ordering issues.
+    dangerouslyIgnoreUnhandledErrors: true,
 
     // Coverage stays at root (not supported in project configs)
     coverage: {
