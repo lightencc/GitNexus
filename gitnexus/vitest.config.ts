@@ -38,7 +38,13 @@ export default defineConfig({
 
     // LadybugDB's native mmap addon causes file-lock conflicts when vitest
     // runs lbug test files in parallel forks on Windows.  The 'lbug-db'
-    // project forces sequential execution; everything else runs in parallel.
+    // project forces sequential execution in a single fork.
+    //
+    // isolate: false keeps all 8 files in one fork process — the fork only
+    // exits once after all files complete, avoiding repeated N-API destructor
+    // crashes on macOS that kill the worker between files.  Module state
+    // (ftsLoaded, adapter connections) persists across files, which is safe
+    // because each file clears/reseeds data via withTestLbugDB.
     projects: [
       {
         extends: true,
@@ -55,6 +61,7 @@ export default defineConfig({
             'test/integration/augmentation.test.ts',
           ],
           fileParallelism: false,
+          isolate: false,
         },
       },
       {
