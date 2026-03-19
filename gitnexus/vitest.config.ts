@@ -62,12 +62,14 @@ export default defineConfig({
           ],
           fileParallelism: false,
           isolate: false,
+          sequence: { groupOrder: 1 },
         },
       },
       {
         extends: true,
         test: {
           name: 'default',
+          sequence: { groupOrder: 2 },
           include: ['test/**/*.test.ts'],
           exclude: [
             'test/integration/lbug-core-adapter.test.ts',
