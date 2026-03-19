@@ -1336,3 +1336,49 @@ describe('Write access tracking (PHP)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): $user = getUser(); $user->save()
+// ---------------------------------------------------------------------------
+
+describe('PHP call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves $user->save() to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('App')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Method chain binding (Phase 9C): getUser() → ->getCity() → ->save()
+// ---------------------------------------------------------------------------
+
+describe('PHP method chain binding via unified fixpoint (Phase 9C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-method-chain-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves $city->save() to City#save via method chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processChain' && c.targetFilePath.includes('App')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

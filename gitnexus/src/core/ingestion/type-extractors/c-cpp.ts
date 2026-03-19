@@ -171,7 +171,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   const declarator = node.childForFieldName('declarator');
   if (!declarator || declarator.type !== 'init_declarator') return undefined;
   const value = declarator.childForFieldName('value');
-  if (!value || value.type !== 'identifier') return undefined;
+  if (!value) return undefined;
   const nameNode = declarator.childForFieldName('declarator');
   if (!nameNode) return undefined;
   const finalName = nameNode.type === 'pointer_declarator' || nameNode.type === 'reference_declarator'
@@ -179,7 +179,31 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   if (!finalName) return undefined;
   const lhs = extractVarName(finalName);
   if (!lhs || scopeEnv.has(lhs)) return undefined;
-  return { kind: 'copy', lhs, rhs: value.text };
+  if (value.type === 'identifier') return { kind: 'copy', lhs, rhs: value.text };
+  // field_expression RHS → fieldAccess (a.field)
+  if (value.type === 'field_expression') {
+    const obj = value.firstNamedChild;
+    const field = value.lastNamedChild;
+    if (obj?.type === 'identifier' && field?.type === 'field_identifier') {
+      return { kind: 'fieldAccess', lhs, receiver: obj.text, field: field.text };
+    }
+  }
+  // call_expression RHS
+  if (value.type === 'call_expression') {
+    const funcNode = value.childForFieldName('function');
+    if (funcNode?.type === 'identifier') {
+      return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+    // method call with receiver: call_expression → function: field_expression
+    if (funcNode?.type === 'field_expression') {
+      const obj = funcNode.firstNamedChild;
+      const field = funcNode.lastNamedChild;
+      if (obj?.type === 'identifier' && field?.type === 'field_identifier') {
+        return { kind: 'methodCallResult', lhs, receiver: obj.text, method: field.text };
+      }
+    }
+  }
+  return undefined;
 };
 
 // --- For-loop Tier 1c ---

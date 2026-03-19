@@ -1429,3 +1429,49 @@ describe('Write access tracking (Rust)', () => {
     expect(scoreWrite!.source).toBe('update_user');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): let user = get_user(); user.save()
+// ---------------------------------------------------------------------------
+
+describe('Rust call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process_user' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Method chain binding (Phase 9C): get_user() → .address → .get_city() → .save()
+// ---------------------------------------------------------------------------
+
+describe('Rust method chain binding via unified fixpoint (Phase 9C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-method-chain-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves city.save() to City#save via method chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process_chain' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

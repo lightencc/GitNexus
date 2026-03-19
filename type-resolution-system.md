@@ -7,7 +7,7 @@ When the code contains a call such as `user.save()`, the resolver tries to deter
 This system is designed to be:
 
 - **Conservative** — it prefers missing a binding over introducing a misleading one
-- **Single-pass** — bindings are collected during a single AST walk, with a limited post-pass for assignment propagation
+- **Walk + fixpoint** — bindings are collected during a single AST walk, then a unified fixpoint loop iterates over pending assignments (copy, callResult, fieldAccess, methodCallResult) until no new bindings are produced
 - **Scope-aware** — function-local bindings are isolated from file-level bindings
 - **Per-file** — the environment is built for one file at a time, though it may consult the global `SymbolTable` for validation in specific cases
 
@@ -292,16 +292,20 @@ const alias = user
 const other = alias
 ```
 
-This is handled after the main walk through a single pass over pending assignments.
-
-This supports simple forward propagation, but there is no iterative fixpoint step. For example:
+This is handled after the main walk through a unified fixpoint loop over all pending assignments (copy, callResult, fieldAccess, methodCallResult). The loop iterates until no new bindings are produced (max 10 iterations), enabling arbitrary-depth mixed chains and reverse-order resolution:
 
 ```typescript
-const b = a
-const a: User = getUser()
+const b = a              // iteration 2: b → User (a now resolved)
+const a: User = getUser()  // iteration 1: a → User
 ```
 
-will not resolve `b`.
+Both `a` and `b` resolve correctly. The fixpoint also handles chains mixing field access and method calls:
+
+```typescript
+const user = getUser()       // callResult → User
+const addr = user.address    // fieldAccess → Address
+const city = addr.getCity()  // methodCallResult → City
+```
 
 ---
 
@@ -359,7 +363,7 @@ A key detail is that some initializer bindings are not fully resolved inside `Ty
 - validated class / struct constructor candidates
 - uniquely resolved function or method calls that expose a usable return type
 
-So return-type-aware receiver inference already exists in a constrained downstream form today. Phase 7.3 extended this by threading `ReturnTypeLookup` into `TypeEnv` via `ForLoopExtractorContext`, enabling for-loop call-expression iterables (e.g., `for (const u of getUsers())`) to resolve element types in 7 languages (TS/JS, Java, Kotlin, C#, Go, Rust, Python, PHP). General assignment propagation (`var x = f()` binding the return type of `f` into the scope env) remains pending — the `pendingCallResults` infrastructure exists but is dormant until Phase 9.
+So return-type-aware receiver inference already exists in a constrained downstream form today. Phase 7.3 extended this by threading `ReturnTypeLookup` into `TypeEnv` via `ForLoopExtractorContext`, enabling for-loop call-expression iterables (e.g., `for (const u of getUsers())`) to resolve element types in 7 languages (TS/JS, Java, Kotlin, C#, Go, Rust, Python, PHP). Phase 9 activated simple call-result binding (`var x = f()`) across all 11 supported languages (Swift excluded). Phase 9C replaced the sequential Tier 2b/2a with a unified fixpoint loop that handles four binding kinds — `callResult`, `copy`, `fieldAccess`, and `methodCallResult` — iterating until no new bindings are produced. This enables arbitrary-depth mixed chains like `const user = getUser(); const addr = user.address; const city = addr.getCity(); city.save()`.
 
 ---
 
@@ -377,6 +381,9 @@ So return-type-aware receiver inference already exists in a constrained downstre
 | Field/property type resolution | Yes | No† | Yes | Yes | Yes | Yes | Yes | Yes* | Yes | YARD | No | Yes | No‡ |
 | Comment-based types | JSDoc | JSDoc | No | No | No | No | No | No | PHPDoc | YARD | No | No | No |
 | Return type extraction | JSDoc | JSDoc | No | No | No | No | No | No | PHPDoc | YARD | No | No | No |
+| Call-result variable binding | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes¶ | No | Yes | No |
+| Field access binding | Yes | No† | Yes | Yes | Yes | Yes | Yes | No‖ | Yes | N/A | No | Yes | No |
+| Method-call-result binding | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes¶ | No | Yes | No |
 | Write access (ACCESSES write) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes§ | Yes | Yes | Yes | No |
 
 \* Python class-level annotated attributes (`address: Address`) now resolve `declaredType` correctly. The `self.x` instance attribute pattern is not yet supported.
@@ -384,6 +391,12 @@ So return-type-aware receiver inference already exists in a constrained downstre
 † JS field topology is captured (`field_definition` → `HAS_PROPERTY` edges) but `declaredType` is never set — JS has no AST type annotations. Disambiguation via `lookupFieldByOwner` requires `declaredType`. JSDoc `@type` support is a Phase 9 candidate.
 
 ‡ C has no `@definition.property` query pattern. Struct member fields are not captured. C++ captures class/struct member fields via `field_declaration`.
+
+¶ Ruby call-result and method-call-result binding work via `call`/`method_call` nodes. Ruby uses method calls for both field access and method calls — there is no separate field access node type.
+
+‖ Python class-level annotated attributes (`address: Address`) have `declaredType`, but `self.x` instance attributes do not. Field access binding only works for class-level annotated fields.
+
+**Note on `this`/`self`/`$this` receivers:** Field access and method-call-result binding with `this`/`self`/`$this` as the receiver do not resolve in the fixpoint loop because these keywords are not stored in `scopeEnv`. They are resolved on-demand at call sites via `findEnclosingClassName()` AST walk. This is consistent across all languages and not a regression.
 
 § PHP write access covers instance property writes (`$obj->field = value`) and static property writes (`ClassName::$field = value`). Nullsafe writes (`$obj?->field = value`) are not tracked because this is invalid PHP syntax — null-safe member access on the left-hand side of assignment is a parse error.
 
@@ -414,11 +427,12 @@ This is enough to materially improve call-edge precision even without implementi
 Important gaps still remain:
 
 - no general cross-file propagation of inferred bindings
-- no fixpoint inference
+- `this`/`self`/`$this` receivers are not resolved in the fixpoint loop (resolved on-demand at call sites via AST walk instead)
 - limited branch-sensitive narrowing outside selected pattern constructs
 - limited Swift support compared with other languages
 - no complete destructuring-based field typing
-- no broad expression-level return-type propagation inside `TypeEnv` (for-loop call-expression iterables are resolved in 7 languages via `ReturnTypeLookup`, but general `var x = f()` assignment propagation is pending)
+- no MRO/inheritance walking for field lookups (`lookupFieldByOwner` is direct-only)
+- for-loop variables bound at walk time cannot see fixpoint-resolved types (Phase 9B gap)
 
 ---
 

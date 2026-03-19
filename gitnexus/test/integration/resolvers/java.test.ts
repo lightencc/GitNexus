@@ -1232,3 +1232,49 @@ describe('Write access tracking (Java)', () => {
     expect(addressWrite!.source).toBe('updateUser');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): var user = getUser(); user.save()
+// ---------------------------------------------------------------------------
+
+describe('Java call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('User')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Method chain binding (Phase 9C): getUser() → .address → .getCity() → .save()
+// ---------------------------------------------------------------------------
+
+describe('Java method chain binding via unified fixpoint (Phase 9C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-method-chain-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves city.save() to City#save via method chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processChain' && c.targetFilePath.includes('Models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

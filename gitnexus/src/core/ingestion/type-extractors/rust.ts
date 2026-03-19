@@ -197,7 +197,34 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   if (!pattern || !value) return undefined;
   const lhs = extractVarName(pattern);
   if (!lhs || scopeEnv.has(lhs)) return undefined;
-  if (value.type === 'identifier') return { kind: 'copy', lhs, rhs: value.text };
+  // Unwrap Rust .await: `let user = get_user().await` → call_expression
+  const unwrapped = unwrapAwait(value) ?? value;
+  if (unwrapped.type === 'identifier') return { kind: 'copy', lhs, rhs: unwrapped.text };
+  // field_expression RHS → fieldAccess (a.field)
+  if (unwrapped.type === 'field_expression') {
+    const obj = unwrapped.firstNamedChild;
+    const field = unwrapped.lastNamedChild;
+    if (obj?.type === 'identifier' && field?.type === 'field_identifier') {
+      return { kind: 'fieldAccess', lhs, receiver: obj.text, field: field.text };
+    }
+  }
+  // call_expression RHS → callResult (simple calls only)
+  if (unwrapped.type === 'call_expression') {
+    const funcNode = unwrapped.childForFieldName('function');
+    if (funcNode?.type === 'identifier') {
+      return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+  }
+  // method_call_expression RHS → methodCallResult (receiver.method())
+  if (unwrapped.type === 'method_call_expression') {
+    const obj = unwrapped.firstNamedChild;
+    if (obj?.type === 'identifier') {
+      const methodNode = unwrapped.childForFieldName('name') ?? unwrapped.namedChild(1);
+      if (methodNode?.type === 'field_identifier') {
+        return { kind: 'methodCallResult', lhs, receiver: obj.text, method: methodNode.text };
+      }
+    }
+  }
   return undefined;
 };
 
