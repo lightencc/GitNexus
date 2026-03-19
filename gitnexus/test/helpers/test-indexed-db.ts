@@ -118,13 +118,17 @@ export function withTestLbugDB(
       }
     }
 
-    // 7. Close core adapter, then open pool adapter (read-only).
-    //    On Windows, LadybugDB enforces file locks — writable + read-only
-    //    can't coexist on the same path, so we must close the core first.
+    // 7. Open pool adapter by injecting the core adapter's writable Database.
+    //    LadybugDB enforces file locks — writable + read-only can't coexist
+    //    on the same path, and db.close() segfaults on macOS due to N-API
+    //    destructor issues.  Reusing the writable Database avoids both problems.
+    //    Write protection is enforced at the query validation layer (isWriteQuery)
+    //    rather than at the native DB level.
     if (options?.poolAdapter) {
-      await adapter.closeLbug();
-      const { initLbug: poolInitLbug } = await import('../../src/mcp/core/lbug-adapter.js');
-      await poolInitLbug(repoId, dbPath);
+      const coreDb = adapter.getDatabase();
+      if (!coreDb) throw new Error('withTestLbugDB: core adapter has no open Database');
+      const { initLbugWithDb } = await import('../../src/mcp/core/lbug-adapter.js');
+      await initLbugWithDb(repoId, coreDb, dbPath);
     }
 
     const cleanup = async () => {

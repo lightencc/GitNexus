@@ -42,6 +42,8 @@ interface SharedDB {
   db: lbug.Database;
   refCount: number;
   ftsLoaded: boolean;
+  /** When true, closeOne skips db.close() — the Database is owned externally. */
+  external?: boolean;
 }
 const dbCache = new Map<string, SharedDB>();
 
@@ -120,13 +122,22 @@ function closeOne(repoId: string): void {
   // Checked-out connections can't be closed here — they're in-flight.
   // The checkin() function detects entry.closed and closes them on return.
 
-  // Only close the Database when no other repoIds reference it
+  // Only close the Database when no other repoIds reference it.
+  // External databases (injected via initLbugWithDb) are never closed here —
+  // the core adapter owns them and handles their lifecycle.
   const shared = dbCache.get(entry.dbPath);
   if (shared) {
     shared.refCount--;
     if (shared.refCount === 0) {
-      shared.db.close().catch(() => {});
-      dbCache.delete(entry.dbPath);
+      if (shared.external) {
+        // External databases are owned by the core adapter — don't close
+        // or remove from cache.  Keep the entry so future initLbug() calls
+        // for the same dbPath reuse it instead of hitting a file lock.
+        shared.refCount = 0;
+      } else {
+        shared.db.close().catch(() => {});
+        dbCache.delete(entry.dbPath);
+      }
     }
   }
 
@@ -298,6 +309,68 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
 }
 
 /**
+ * Initialize a pool entry from a pre-existing Database object.
+ *
+ * Used in tests to avoid the writable→close→read-only cycle that crashes
+ * on macOS due to N-API destructor segfaults.  The pool adapter reuses
+ * the core adapter's writable Database instead of opening a new read-only one.
+ *
+ * The Database is registered in the shared dbCache so closeOne() decrements
+ * the refCount correctly.  If the Database is already cached (e.g. another
+ * repoId already injected it), the existing entry is reused.
+ */
+export async function initLbugWithDb(
+  repoId: string,
+  existingDb: lbug.Database,
+  dbPath: string,
+): Promise<void> {
+  const existing = pool.get(repoId);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    return;
+  }
+
+  // Register in dbCache with external: true so other initLbug() calls
+  // for the same dbPath reuse this Database instead of trying to open
+  // a new one (which would fail with a file lock error).
+  // closeOne() respects the external flag and skips db.close().
+  let shared = dbCache.get(dbPath);
+  if (!shared) {
+    shared = { db: existingDb, refCount: 0, ftsLoaded: false, external: true };
+    dbCache.set(dbPath, shared);
+  }
+  shared.refCount++;
+
+  const available: lbug.Connection[] = [];
+  preWarmActive = true;
+  try {
+    for (let i = 0; i < MAX_CONNS_PER_REPO; i++) {
+      available.push(createConnection(existingDb));
+    }
+  } finally {
+    preWarmActive = false;
+  }
+
+  // Load FTS extension if not already loaded on this Database
+  try {
+    await available[0].query('LOAD EXTENSION fts');
+  } catch {
+    // Extension may already be loaded or not installed
+  }
+
+  pool.set(repoId, { 
+    db: existingDb,
+    available,
+    checkedOut: 0,
+    waiters: [],
+    lastUsed: Date.now(),
+    dbPath,
+    closed: false 
+  });
+  ensureIdleTimer();
+}
+
+/**
  * Checkout a connection from the pool.
  * Returns an available connection, or creates a new one if under the cap.
  * If all connections are busy and at cap, queues the caller until one is returned.
@@ -378,6 +451,10 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
     throw new Error(`LadybugDB not initialized for repo "${repoId}". Call initLbug first.`);
   }
 
+  if (isWriteQuery(cypher)) {
+    throw new Error('Write operations are not allowed. The pool adapter is read-only.');
+  }
+
   entry.lastUsed = Date.now();
 
   const conn = await checkout(entry);
@@ -449,3 +526,11 @@ export const closeLbug = async (repoId?: string): Promise<void> => {
  * Check if a specific repo's pool is active
  */
 export const isLbugReady = (repoId: string): boolean => pool.has(repoId);
+
+/** Regex to detect write operations in user-supplied Cypher queries */
+export const CYPHER_WRITE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
+
+/** Check if a Cypher query contains write operations */
+export function isWriteQuery(query: string): boolean {
+  return CYPHER_WRITE_RE.test(query);
+}
