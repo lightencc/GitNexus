@@ -16,8 +16,7 @@ concurrency:
 # ── Reusable workflow orchestration ─────────────────────────────────
 # Each concern lives in its own workflow file for maintainability:
 #   ci-quality.yml       — typecheck (tsc --noEmit)
-#   ci-unit-tests.yml    — unit tests with coverage + cross-platform
-#   ci-integration.yml   — integration test matrix (3 OS x 4 groups)
+#   ci-unit-tests.yml    — all tests with coverage (ubuntu) + cross-platform
 #
 # Shared setup is DRY via .github/actions/setup-gitnexus composite action.
 
@@ -27,15 +26,8 @@ jobs:
     permissions:
       contents: read
 
-  unit-tests:
+  tests:
     uses: ./.github/workflows/ci-unit-tests.yml
-    permissions:
-      contents: read
-
-  integration:
-    uses: ./.github/workflows/ci-integration.yml
-    with:
-      collect-coverage: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
 
@@ -47,7 +39,7 @@ jobs:
   save-pr-meta:
     name: Save PR Metadata
     if: always() && github.event_name == 'pull_request'
-    needs: [quality, unit-tests, integration]
+    needs: [quality, tests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -56,14 +48,12 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.number }}
           QUALITY: ${{ needs.quality.result }}
-          UNIT: ${{ needs.unit-tests.result }}
-          INTEG: ${{ needs.integration.result }}
+          TESTS: ${{ needs.tests.result }}
         run: |
           mkdir -p pr-meta
           echo "$PR_NUMBER"  > pr-meta/pr_number
           echo "$QUALITY"    > pr-meta/quality_result
-          echo "$UNIT"       > pr-meta/unit_result
-          echo "$INTEG"      > pr-meta/integration_result
+          echo "$TESTS"      > pr-meta/tests_result
 
       - name: Upload PR metadata
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -76,7 +66,7 @@ jobs:
   # Single required check for branch protection.
   ci-status:
     name: CI Gate
-    needs: [quality, unit-tests, integration]
+    needs: [quality, tests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -85,15 +75,12 @@ jobs:
         shell: bash
         env:
           QUALITY: ${{ needs.quality.result }}
-          UNIT: ${{ needs.unit-tests.result }}
-          INTEG: ${{ needs.integration.result }}
+          TESTS: ${{ needs.tests.result }}
         run: |
-          echo "Quality:     $QUALITY"
-          echo "Unit Tests:  $UNIT"
-          echo "Integration: $INTEG"
+          echo "Quality:  $QUALITY"
+          echo "Tests:    $TESTS"
           if [[ "$QUALITY" != "success" ]] ||
-             [[ "$UNIT" != "success" ]] ||
-             [[ "$INTEG" != "success" ]]; then
+             [[ "$TESTS" != "success" ]]; then
             echo "::error::One or more CI jobs failed"
             exit 1
           fi
