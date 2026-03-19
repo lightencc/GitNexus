@@ -41,8 +41,8 @@ export default async function setup({ provide }: GlobalSetupContext) {
     // FTS may already be installed system-wide — not fatal
   }
 
-  conn.close();
-  db.close();
+  await conn.close();
+  await db.close();
 
   // Share the dbPath with all test files via inject('lbugDbPath')
   provide('lbugDbPath', dbPath);

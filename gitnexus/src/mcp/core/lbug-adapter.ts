@@ -108,9 +108,12 @@ function closeOne(repoId: string): void {
 
   entry.closed = true;
 
-  // Close available connections (safe — they're not in use)
+  // Close available connections — fire-and-forget with .catch() to prevent
+  // unhandled rejections.  Native close() returns Promise<void> but can crash
+  // the N-API destructor on macOS/Windows; deferring to process exit lets
+  // dangerouslyIgnoreUnhandledErrors absorb the crash.
   for (const conn of entry.available) {
-    try { conn.close(); } catch {}
+    conn.close().catch(() => {});
   }
   entry.available.length = 0;
 
@@ -122,7 +125,7 @@ function closeOne(repoId: string): void {
   if (shared) {
     shared.refCount--;
     if (shared.refCount === 0) {
-      try { shared.db.close(); } catch {}
+      shared.db.close().catch(() => {});
       dbCache.delete(entry.dbPath);
     }
   }
@@ -343,7 +346,7 @@ function checkout(entry: PoolEntry): Promise<lbug.Connection> {
 function checkin(entry: PoolEntry, conn: lbug.Connection): void {
   if (entry.closed) {
     // Pool entry was deleted during checkout — close the orphaned connection
-    try { conn.close(); } catch {}
+    conn.close().catch(() => {});
     return;
   }
   if (entry.waiters.length > 0) {
