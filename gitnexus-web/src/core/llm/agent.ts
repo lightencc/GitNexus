@@ -72,6 +72,12 @@ You are an investigator. For each question:
 4. **Cite** → Ground every finding with [[file:line]] or [[Type:Name]]
 5. **Validate** → Use cypher to validate the results and confirm completeness of context before final output. ( MUST DO )
 
+## 🗣️ VISIBLE PROGRESS UPDATES
+- During tool use, emit short user-visible status updates so the UI can show your work as it happens.
+- Before a tool call, say in one short sentence what you are checking next.
+- After an important tool result, say in one short sentence what changed or what you will do next.
+- Keep these updates factual and concise. Do not dump hidden chain-of-thought or long internal monologues.
+
 ## 🛠️ TOOLS
 - **\`search\`** — Hybrid search. Results grouped by process with cluster context.
 - **\`cypher\`** — Cypher queries against the graph. Use \`{{QUERY_VECTOR}}\` for vector search.
@@ -330,6 +336,144 @@ export interface AgentMessage {
   content: string;
 }
 
+type StreamContentSegment = {
+  type: 'reasoning' | 'text';
+  content: string;
+  snapshot?: boolean;
+};
+
+const collectStringParts = (value: unknown): string[] => {
+  if (typeof value === 'string') {
+    return value.length > 0 ? [value] : [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap(collectStringParts);
+  }
+
+  if (!value || typeof value !== 'object') {
+    return [];
+  }
+
+  const record = value as Record<string, unknown>;
+
+  if (typeof record.text === 'string' && record.text.length > 0) {
+    return [record.text];
+  }
+
+  if (typeof record.reasoning === 'string' && record.reasoning.length > 0) {
+    return [record.reasoning];
+  }
+
+  if (typeof record.thinking === 'string' && record.thinking.length > 0) {
+    return [record.thinking];
+  }
+
+  if (Array.isArray(record.summary)) {
+    return record.summary.flatMap(collectStringParts);
+  }
+
+  return [];
+};
+
+const extractReasoningFromBlock = (block: unknown): string => {
+  if (!block || typeof block !== 'object') {
+    return '';
+  }
+
+  const record = block as Record<string, unknown>;
+  if (record.type === 'reasoning') {
+    return collectStringParts(record.reasoning ?? record.summary).join('');
+  }
+
+  if (record.type === 'thinking') {
+    return collectStringParts(record.thinking ?? record.summary).join('');
+  }
+
+  return '';
+};
+
+const extractTextFromBlock = (block: unknown): string => {
+  if (typeof block === 'string') {
+    return block;
+  }
+
+  if (!block || typeof block !== 'object') {
+    return '';
+  }
+
+  const record = block as Record<string, unknown>;
+  if (record.type === 'text' && typeof record.text === 'string') {
+    return record.text;
+  }
+
+  return '';
+};
+
+const extractFallbackReasoning = (additionalKwargs: unknown): string => {
+  if (!additionalKwargs || typeof additionalKwargs !== 'object') {
+    return '';
+  }
+
+  const record = additionalKwargs as Record<string, unknown>;
+  return collectStringParts(
+    record.reasoning_content ?? record.reasoning ?? record.thinking ?? record.summary
+  ).join('');
+};
+
+const extractMessageSegments = (msg: any): StreamContentSegment[] => {
+  const segments: StreamContentSegment[] = [];
+  const rawContent = msg?.content;
+
+  if (Array.isArray(rawContent)) {
+    for (const block of rawContent) {
+      const reasoning = extractReasoningFromBlock(block);
+      if (reasoning) {
+        segments.push({ type: 'reasoning', content: reasoning });
+        continue;
+      }
+
+      const text = extractTextFromBlock(block);
+      if (text) {
+        segments.push({ type: 'text', content: text });
+      }
+    }
+  } else if (typeof rawContent === 'string' && rawContent.length > 0) {
+    segments.push({ type: 'text', content: rawContent });
+  }
+
+  const fallbackReasoning = extractFallbackReasoning(msg?.additional_kwargs);
+  if (fallbackReasoning && !segments.some(segment => segment.type === 'reasoning')) {
+    segments.unshift({
+      type: 'reasoning',
+      content: fallbackReasoning,
+      snapshot: true,
+    });
+  }
+
+  return segments.filter(segment => segment.content.length > 0);
+};
+
+const deltaFromSnapshot = (snapshot: string, previousSnapshot: string): string => {
+  if (!snapshot) {
+    return '';
+  }
+
+  if (!previousSnapshot) {
+    return snapshot;
+  }
+
+  if (snapshot === previousSnapshot) {
+    return '';
+  }
+
+  if (snapshot.startsWith(previousSnapshot)) {
+    return snapshot.slice(previousSnapshot.length);
+  }
+
+  return snapshot;
+};
+
 /**
  * Stream a response from the agent
  * Uses BOTH streamModes for best of both worlds:
@@ -362,12 +506,14 @@ export async function* streamAgentResponse(
     const yieldedToolCalls = new Set<string>();
     const yieldedToolResults = new Set<string>();
     let lastProcessedMsgCount = formattedMessages.length;
-    // Track pending tool calls (for distinguishing reasoning vs final content)
-    let pendingToolCalls = 0;
+    // Track if all tools are done (for distinguishing reasoning vs final content)
+    let allToolsDone = true;
     // Track if we've seen any tool calls in this response turn.
     // Anything before the first tool call should be treated as "reasoning/narration"
     // so the UI can show the Cursor-like loop: plan → tool → update → tool → answer.
     let hasSeenToolCallThisTurn = false;
+    let lastReasoningSnapshot = '';
+    let pendingPreludeContent = '';
     
     for await (const event of stream) {
       // Events come as [streamMode, data] tuples when using multiple modes
@@ -401,43 +547,57 @@ export async function* streamAgentResponse(
         
         const msgType = msg._getType?.() || msg.type || msg.constructor?.name || 'unknown';
         
-        // AIMessageChunk - streaming text tokens
+        // AIMessageChunk - streaming text tokens and provider-native reasoning blocks
         if (msgType === 'ai' || msgType === 'AIMessage' || msgType === 'AIMessageChunk') {
-          const rawContent = msg.content;
           const toolCalls = msg.tool_calls || [];
-          
-          // Handle content that can be string or array of content blocks
-          let content: string = '';
-          if (typeof rawContent === 'string') {
-            content = rawContent;
-          } else if (Array.isArray(rawContent)) {
-            // Content blocks format: [{type: 'text', text: '...'}, ...]
-            content = rawContent
-              .filter((block: any) => block.type === 'text' || typeof block === 'string')
-              .map((block: any) => typeof block === 'string' ? block : block.text || '')
-              .join('');
+
+          if (toolCalls.length > 0 && pendingPreludeContent) {
+            yield {
+              type: 'reasoning',
+              reasoning: pendingPreludeContent,
+            };
+            pendingPreludeContent = '';
           }
-          
-          // If chunk has content, stream it
-          if (content && content.length > 0) {
-            // Determine if this is reasoning/narration vs final answer content.
-            // - Before the first tool call: treat as reasoning (narration)
-            // - Between tool calls/results: treat as reasoning
-            // - After all tools are done: treat as final content
+
+          for (const segment of extractMessageSegments(msg)) {
+            if (segment.type === 'reasoning') {
+              const reasoning = segment.snapshot
+                ? deltaFromSnapshot(segment.content, lastReasoningSnapshot)
+                : segment.content;
+
+              if (segment.snapshot) {
+                lastReasoningSnapshot = segment.content;
+              }
+
+              if (reasoning) {
+                yield {
+                  type: 'reasoning',
+                  reasoning,
+                };
+              }
+              continue;
+            }
+
+            const content = segment.content;
+            if (!hasSeenToolCallThisTurn && allToolsDone && toolCalls.length === 0) {
+              pendingPreludeContent += content;
+              continue;
+            }
+
             const isReasoning =
               !hasSeenToolCallThisTurn ||
               toolCalls.length > 0 ||
-              pendingToolCalls > 0;
+              !allToolsDone;
             yield {
               type: isReasoning ? 'reasoning' : 'content',
               [isReasoning ? 'reasoning' : 'content']: content,
             };
           }
-          
+
           // Track tool calls from message chunks
           if (toolCalls.length > 0) {
             hasSeenToolCallThisTurn = true;
-            pendingToolCalls += toolCalls.length;
+            allToolsDone = false;
             for (const tc of toolCalls) {
               const toolId = tc.id || `tool-${Date.now()}-${Math.random().toString(36).slice(2)}`;
               if (!yieldedToolCalls.has(toolId)) {
@@ -478,8 +638,8 @@ export async function* streamAgentResponse(
                 status: 'completed',
               },
             };
-            // After tool result, decrement pending count
-            pendingToolCalls = Math.max(0, pendingToolCalls - 1);
+            // After tool result, next AI content could be reasoning or final
+            allToolsDone = true;
           }
         }
       }
@@ -499,7 +659,14 @@ export async function* streamAgentResponse(
             for (const tc of toolCalls) {
               const toolId = tc.id || `tool-${Date.now()}`;
               if (!yieldedToolCalls.has(toolId)) {
-                pendingToolCalls++;
+                if (pendingPreludeContent) {
+                  yield {
+                    type: 'reasoning',
+                    reasoning: pendingPreludeContent,
+                  };
+                  pendingPreludeContent = '';
+                }
+                allToolsDone = false;
                 yieldedToolCalls.add(toolId);
                 yield {
                   type: 'tool_call',
@@ -530,13 +697,21 @@ export async function* streamAgentResponse(
                   status: 'completed',
                 },
               };
-              pendingToolCalls = Math.max(0, pendingToolCalls - 1);
+              allToolsDone = true;
             }
           }
         }
         
         lastProcessedMsgCount = stepMessages.length;
       }
+    }
+
+    if (pendingPreludeContent) {
+      yield {
+        type: 'content',
+        content: pendingPreludeContent,
+      };
+      pendingPreludeContent = '';
     }
     
     // DEBUG: Stream completed normally
@@ -576,4 +751,3 @@ export const invokeAgent = async (
   const lastMessage = result.messages[result.messages.length - 1];
   return lastMessage?.content?.toString() ?? 'No response generated.';
 };
-

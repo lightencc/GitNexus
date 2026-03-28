@@ -2,7 +2,7 @@ import { createContext, useContext, useState, useCallback, useRef, useEffect, us
 import type { GraphNode, GraphRelationship, NodeLabel, PipelineProgress } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../core/graph/types';
 import { createKnowledgeGraph } from '../core/graph/graph';
-import type { LLMSettings, ProviderConfig, AgentStreamChunk, ChatMessage, ToolCallInfo, MessageStep } from '../core/llm/types';
+import type { LLMSettings, ProviderConfig, AgentStreamChunk, ChatMessage, ChatSession, ChatSessionState, ToolCallInfo, MessageStep } from '../core/llm/types';
 import { loadSettings, getActiveProviderConfig, saveSettings } from '../core/llm/settings-service';
 import type { AgentMessage } from '../core/llm/agent';
 import { type EdgeType } from '../lib/constants';
@@ -151,6 +151,9 @@ interface AppState {
   agentError: string | null;
 
   // Chat state
+  chatSessions: ChatSession[];
+  chatSessionStates: Record<string, ChatSessionState>;
+  activeChatSessionId: string | null;
   chatMessages: ChatMessage[];
   isChatLoading: boolean;
   currentToolCalls: ToolCallInfo[];
@@ -160,6 +163,9 @@ interface AppState {
   initializeAgent: (overrideProjectName?: string) => Promise<void>;
   sendChatMessage: (message: string) => Promise<void>;
   stopChatResponse: () => void;
+  createChatSession: () => void;
+  selectChatSession: (sessionId: string) => void;
+  deleteChatSession: (sessionId: string) => void;
   clearChat: () => void;
 
   // Code References Panel
@@ -174,6 +180,143 @@ interface AppState {
 }
 
 const AppStateContext = createContext<AppState | null>(null);
+
+const CHAT_SESSIONS_STORAGE_KEY = 'gitnexus.chatSessions.v1';
+const DEFAULT_CHAT_SESSION_TITLE = 'New Chat';
+const MAX_CHAT_SESSION_TITLE_LENGTH = 48;
+
+interface StoredChatSessions {
+  sessions?: ChatSession[];
+  activeChatSessionId?: string | null;
+}
+
+interface InitialChatSessionState {
+  sessions: ChatSession[];
+  activeChatSessionId: string;
+  activeMessages: ChatMessage[];
+}
+
+const createLocalChatSession = (projectName?: string): ChatSession => {
+  const now = Date.now();
+  return {
+    id: `session-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    title: DEFAULT_CHAT_SESSION_TITLE,
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+    projectName,
+  };
+};
+
+const createChatSessionRuntimeState = (): ChatSessionState => ({
+  requestId: null,
+  isLoading: false,
+  currentToolCalls: [],
+  error: null,
+});
+
+const buildChatSessionRuntimeStateMap = (
+  sessions: ChatSession[]
+): Record<string, ChatSessionState> => (
+  Object.fromEntries(
+    sessions.map(session => [session.id, createChatSessionRuntimeState()])
+  )
+);
+
+const deriveChatSessionTitle = (messages: ChatMessage[]): string => {
+  const firstUserMessage = messages.find(
+    message => message.role === 'user' && message.content.trim().length > 0
+  );
+  if (!firstUserMessage) {
+    return DEFAULT_CHAT_SESSION_TITLE;
+  }
+
+  const normalized = firstUserMessage.content.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= MAX_CHAT_SESSION_TITLE_LENGTH) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, MAX_CHAT_SESSION_TITLE_LENGTH - 3)}...`;
+};
+
+const readStoredChatSessions = (): InitialChatSessionState => {
+  if (typeof window === 'undefined') {
+    const session = createLocalChatSession();
+    return {
+      sessions: [session],
+      activeChatSessionId: session.id,
+      activeMessages: session.messages,
+    };
+  }
+
+  try {
+    const raw = window.localStorage.getItem(CHAT_SESSIONS_STORAGE_KEY);
+    if (!raw) {
+      throw new Error('No stored chat sessions');
+    }
+
+    const parsed = JSON.parse(raw) as StoredChatSessions;
+    const sessions = Array.isArray(parsed.sessions)
+      ? parsed.sessions
+        .filter((session): session is ChatSession => !!session && typeof session.id === 'string')
+        .map(session => {
+          const createdAt = typeof session.createdAt === 'number' ? session.createdAt : Date.now();
+          return {
+            ...session,
+            title: typeof session.title === 'string' && session.title.trim().length > 0
+              ? session.title
+              : DEFAULT_CHAT_SESSION_TITLE,
+            messages: Array.isArray(session.messages) ? session.messages : [],
+            createdAt,
+            updatedAt: typeof session.updatedAt === 'number' ? session.updatedAt : createdAt,
+            projectName: typeof session.projectName === 'string' ? session.projectName : undefined,
+          };
+        })
+      : [];
+
+    if (sessions.length === 0) {
+      throw new Error('Stored chat sessions were empty');
+    }
+
+    const activeChatSessionId =
+      typeof parsed.activeChatSessionId === 'string' &&
+      sessions.some(session => session.id === parsed.activeChatSessionId)
+        ? parsed.activeChatSessionId
+        : sessions[0].id;
+    const activeSession = sessions.find(session => session.id === activeChatSessionId) ?? sessions[0];
+
+    return {
+      sessions,
+      activeChatSessionId,
+      activeMessages: activeSession.messages,
+    };
+  } catch {
+    const session = createLocalChatSession();
+    return {
+      sessions: [session],
+      activeChatSessionId: session.id,
+      activeMessages: session.messages,
+    };
+  }
+};
+
+const saveStoredChatSessions = (
+  sessions: ChatSession[],
+  activeChatSessionId: string | null
+) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(
+      CHAT_SESSIONS_STORAGE_KEY,
+      JSON.stringify({ sessions, activeChatSessionId })
+    );
+  } catch {
+    // Ignore localStorage write failures.
+  }
+};
 
 export const AppStateProvider = ({ children }: { children: ReactNode }) => (
   <GraphStateProvider>
@@ -305,17 +448,84 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
   const [isSettingsPanelOpen, setSettingsPanelOpen] = useState(false);
   const [isAgentReady, setIsAgentReady] = useState(false);
   const [isAgentInitializing, setIsAgentInitializing] = useState(false);
-  const [agentError, setAgentError] = useState<string | null>(null);
+  const [agentStatusError, setAgentStatusError] = useState<string | null>(null);
 
   // Chat state
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [isChatLoading, setIsChatLoading] = useState(false);
-  const [currentToolCalls, setCurrentToolCalls] = useState<ToolCallInfo[]>([]);
+  const initialChatSessionStateRef = useRef<InitialChatSessionState | null>(null);
+  if (!initialChatSessionStateRef.current) {
+    initialChatSessionStateRef.current = readStoredChatSessions();
+  }
+
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>(initialChatSessionStateRef.current.sessions);
+  const [chatSessionStates, setChatSessionStates] = useState<Record<string, ChatSessionState>>(
+    () => buildChatSessionRuntimeStateMap(initialChatSessionStateRef.current!.sessions)
+  );
+  const [activeChatSessionId, setActiveChatSessionId] = useState<string | null>(initialChatSessionStateRef.current.activeChatSessionId);
 
   // Code References Panel state
   const [codeReferences, setCodeReferences] = useState<CodeReference[]>([]);
   const [isCodePanelOpen, setCodePanelOpen] = useState(false);
   const [codeReferenceFocus, setCodeReferenceFocus] = useState<CodeReferenceFocus | null>(null);
+
+  const activeChatSessionIdRef = useRef<string | null>(activeChatSessionId);
+  const chatSessionIdsRef = useRef<Set<string>>(new Set(chatSessions.map(session => session.id)));
+  const chatSessionStatesRef = useRef<Record<string, ChatSessionState>>(chatSessionStates);
+
+  useEffect(() => {
+    activeChatSessionIdRef.current = activeChatSessionId;
+  }, [activeChatSessionId]);
+
+  useEffect(() => {
+    chatSessionIdsRef.current = new Set(chatSessions.map(session => session.id));
+  }, [chatSessions]);
+
+  useEffect(() => {
+    chatSessionStatesRef.current = chatSessionStates;
+  }, [chatSessionStates]);
+
+  const activeChatSession = (
+    chatSessions.find(session => session.id === activeChatSessionId)
+    ?? chatSessions[0]
+    ?? null
+  );
+  const chatMessages = activeChatSession?.messages ?? [];
+  const activeChatSessionState = activeChatSessionId
+    ? chatSessionStates[activeChatSessionId] ?? createChatSessionRuntimeState()
+    : createChatSessionRuntimeState();
+  const isChatLoading = activeChatSessionState.isLoading;
+  const currentToolCalls = activeChatSessionState.currentToolCalls;
+  const agentError = activeChatSessionState.error ?? agentStatusError;
+
+  useEffect(() => {
+    saveStoredChatSessions(chatSessions, activeChatSessionId);
+  }, [chatSessions, activeChatSessionId]);
+
+  useEffect(() => {
+    if (!activeChatSessionId || !projectName) {
+      return;
+    }
+
+    setChatSessions(prev => {
+      let changed = false;
+      const next = prev.map(session => {
+        if (session.id !== activeChatSessionId) {
+          return session;
+        }
+
+        if (session.projectName === projectName) {
+          return session;
+        }
+
+        changed = true;
+        return {
+          ...session,
+          projectName,
+        };
+      });
+
+      return changed ? next : prev;
+    });
+  }, [activeChatSessionId, projectName]);
 
   // Map of normalized file path → node ID for graph-based lookups
   const fileNodeByPath = useMemo(() => {
@@ -513,6 +723,70 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
     return backendSearch(query, { limit: k, mode: 'semantic', enrich: true, repo: repoRef.current });
   }, []);
 
+  const updateChatSessionMessages = useCallback((
+    sessionId: string,
+    updater: (messages: ChatMessage[]) => ChatMessage[],
+    options?: { touchUpdatedAt?: boolean }
+  ) => {
+    setChatSessions(prev => {
+      let changed = false;
+      const touchedAt = options?.touchUpdatedAt ? Date.now() : null;
+      const next = prev.map(session => {
+        if (session.id !== sessionId) {
+          return session;
+        }
+
+        const nextMessages = updater(session.messages);
+        if (nextMessages === session.messages) {
+          return session;
+        }
+
+        changed = true;
+        return {
+          ...session,
+          messages: nextMessages,
+          title: deriveChatSessionTitle(nextMessages),
+          updatedAt: touchedAt ?? session.updatedAt,
+          projectName: session.projectName || projectName || undefined,
+        };
+      });
+
+      return changed ? next : prev;
+    });
+  }, [projectName]);
+
+  const updateChatSessionRuntime = useCallback((
+    sessionId: string,
+    updater: (state: ChatSessionState) => ChatSessionState,
+    expectedRequestId?: string
+  ) => {
+    setChatSessionStates(prev => {
+      const current = prev[sessionId];
+      if (!current) {
+        return prev;
+      }
+
+      if (expectedRequestId !== undefined && current.requestId !== expectedRequestId) {
+        return prev;
+      }
+
+      const next = updater(current);
+      if (next === current) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        [sessionId]: next,
+      };
+    });
+  }, []);
+
+  const isSessionRequestCurrent = useCallback((sessionId: string, requestId: string): boolean => {
+    const currentState = chatSessionStatesRef.current[sessionId];
+    return chatSessionIdsRef.current.has(sessionId) && !!currentState && currentState.requestId === requestId;
+  }, []);
+
 
   // LLM methods
   const updateLLMSettings = useCallback((updates: Partial<LLMSettings>) => {
@@ -533,12 +807,12 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
   const initializeAgent = useCallback(async (overrideProjectName?: string): Promise<void> => {
     const config = getActiveProviderConfig();
     if (!config) {
-      setAgentError('Please configure an LLM provider in settings');
+      setAgentStatusError('Please configure an LLM provider in settings');
       return;
     }
 
     setIsAgentInitializing(true);
-    setAgentError(null);
+    setAgentStatusError(null);
 
     try {
       const effectiveProjectName = overrideProjectName || projectName || 'project';
@@ -560,13 +834,13 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
 
       agentRef.current = createGraphRAGAgent(config, backend, codebaseContext);
       setIsAgentReady(true);
-      setAgentError(null);
+      setAgentStatusError(null);
       if (import.meta.env.DEV) {
         console.log('✅ Agent initialized successfully');
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setAgentError(message);
+      setAgentStatusError(message);
       setIsAgentReady(false);
     } finally {
       setIsAgentInitializing(false);
@@ -574,28 +848,41 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
   }, [projectName]);
 
   const sendChatMessage = useCallback(async (message: string): Promise<void> => {
-    // Refresh Code panel for the new question: keep user-pinned refs, clear old AI citations
-    clearAICodeReferences();
-    // Also clear previous tool-driven AI highlights (highlight_in_graph)
-    clearAIToolHighlights();
-
-    if (!isAgentReady) {
-      // Try to initialize first
-      await initializeAgent();
-      if (!agentRef.current) return;
+    const sessionId = activeChatSessionIdRef.current;
+    if (!sessionId) {
+      return;
     }
 
-    // Add user message
+    if (chatSessionStatesRef.current[sessionId]?.isLoading) {
+      return;
+    }
+
+    // Refresh Code panel for the new question: keep user-pinned refs, clear old AI citations
+    if (sessionId === activeChatSessionIdRef.current) {
+      clearAICodeReferences();
+      clearAIToolHighlights();
+    }
+
+    if (!isAgentReady) {
+      await initializeAgent();
+      if (!agentRef.current) {
+        return;
+      }
+    }
+
+    const targetSession = chatSessions.find(session => session.id === sessionId);
+    if (!targetSession) {
+      return;
+    }
+
     const userMessage: ChatMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
       content: message,
       timestamp: Date.now(),
     };
-    setChatMessages(prev => [...prev, userMessage]);
+    updateChatSessionMessages(sessionId, prev => [...prev, userMessage], { touchUpdatedAt: true });
 
-    // If embeddings are running and we're currently creating the vector index,
-    // avoid a confusing "Embeddings not ready" error and give a clear wait message.
     if (embeddingStatus === 'indexing') {
       const assistantMessage: ChatMessage = {
         id: `assistant-${Date.now()}`,
@@ -603,40 +890,47 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
         content: 'Wait a moment, vector index is being created.',
         timestamp: Date.now(),
       };
-      setChatMessages(prev => [...prev, assistantMessage]);
-      setAgentError(null);
-      setIsChatLoading(false);
-      setCurrentToolCalls([]);
+      updateChatSessionMessages(sessionId, prev => [...prev, assistantMessage], { touchUpdatedAt: true });
+      updateChatSessionRuntime(sessionId, current => ({
+        ...current,
+        requestId: null,
+        isLoading: false,
+        currentToolCalls: [],
+        error: null,
+      }));
       return;
     }
 
-    setIsChatLoading(true);
-    setCurrentToolCalls([]);
+    const requestId = `chat-${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setChatSessionStates(prev => ({
+      ...prev,
+      [sessionId]: {
+        ...(prev[sessionId] ?? createChatSessionRuntimeState()),
+        requestId,
+        isLoading: true,
+        currentToolCalls: [],
+        error: null,
+      },
+    }));
 
-    // Prepare message history for agent (convert our format to AgentMessage format)
-    const history: AgentMessage[] = [...chatMessages, userMessage].map(m => ({
+    const history: AgentMessage[] = [...targetSession.messages, userMessage].map(m => ({
       role: m.role === 'tool' ? 'assistant' : m.role,
       content: m.content,
     }));
 
-    // Create placeholder for assistant response
     const assistantMessageId = `assistant-${Date.now()}`;
-    // Use an ordered steps array to preserve execution order (reasoning → tool → reasoning → tool → answer)
     const stepsForMessage: MessageStep[] = [];
-    // Keep toolCalls for backwards compat and currentToolCalls state
     const toolCallsForMessage: ToolCallInfo[] = [];
     let stepCounter = 0;
 
-    // Helper to update the message with current steps
-    const updateMessage = () => {
-      // Build content from steps for backwards compatibility
+    const updateMessage = (touchUpdatedAt: boolean = false) => {
       const contentParts = stepsForMessage
         .filter(s => s.type === 'reasoning' || s.type === 'content')
         .map(s => s.content)
         .filter(Boolean);
       const content = contentParts.join('\n\n');
 
-      setChatMessages(prev => {
+      updateChatSessionMessages(sessionId, prev => {
         const existing = prev.find(m => m.id === assistantMessageId);
         const newMessage: ChatMessage = {
           id: assistantMessageId,
@@ -648,14 +942,22 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
         };
         if (existing) {
           return prev.map(m => m.id === assistantMessageId ? newMessage : m);
-        } else {
-          return [...prev, newMessage];
         }
-      });
+        return [...prev, newMessage];
+      }, { touchUpdatedAt });
     };
+
     let pendingUpdate = false;
-    const scheduleMessageUpdate = () => {
-      if (pendingUpdate) return;
+    const scheduleMessageUpdate = (touchUpdatedAt: boolean = false) => {
+      if (touchUpdatedAt) {
+        updateMessage(true);
+        return;
+      }
+
+      if (pendingUpdate) {
+        return;
+      }
+
       pendingUpdate = true;
       requestAnimationFrame(() => {
         pendingUpdate = false;
@@ -664,20 +966,21 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
     };
 
     try {
-      const onChunk = ((chunk: AgentStreamChunk) => {
+      const onChunk = (chunk: AgentStreamChunk) => {
+        if (!isSessionRequestCurrent(sessionId, requestId)) {
+          return;
+        }
+
         switch (chunk.type) {
           case 'reasoning':
-            // LLM's thinking/reasoning - accumulate contiguous reasoning
             if (chunk.reasoning) {
               const lastStep = stepsForMessage[stepsForMessage.length - 1];
               if (lastStep && lastStep.type === 'reasoning') {
-                // Append to existing reasoning step
                 stepsForMessage[stepsForMessage.length - 1] = {
                   ...lastStep,
                   content: (lastStep.content || '') + chunk.reasoning,
                 };
               } else {
-                // Create new reasoning step (after tool calls or at start)
                 stepsForMessage.push({
                   id: `step-${stepCounter++}`,
                   type: 'reasoning',
@@ -689,18 +992,14 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
             break;
 
           case 'content':
-            // Final answer content - accumulate into contiguous content step
             if (chunk.content) {
-              // Only append if the LAST step is a content step (contiguous streaming)
               const lastStep = stepsForMessage[stepsForMessage.length - 1];
               if (lastStep && lastStep.type === 'content') {
-                // Append to existing content step
                 stepsForMessage[stepsForMessage.length - 1] = {
                   ...lastStep,
                   content: (lastStep.content || '') + chunk.content,
                 };
               } else {
-                // Create new content step (after tool calls or at start)
                 stepsForMessage.push({
                   id: `step-${stepCounter++}`,
                   type: 'content',
@@ -709,15 +1008,15 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
               }
               scheduleMessageUpdate();
 
-              // Parse inline grounding references and add them to the Code References panel.
-              // Supports: [[file.ts:10-25]] (file refs) and [[Class:View]] (node refs)
+              if (activeChatSessionIdRef.current !== sessionId) {
+                break;
+              }
+
               const currentContentStep = stepsForMessage[stepsForMessage.length - 1];
               const fullText = (currentContentStep && currentContentStep.type === 'content')
                 ? (currentContentStep.content || '')
                 : '';
 
-              // Pattern 1: File refs - [[path/file.ext]] or [[path/file.ext:line]] or [[path/file.ext:line-line]]
-              // Line numbers are optional
               const fileRefRegex = new RegExp(FILE_REF_REGEX.source, FILE_REF_REGEX.flags);
               let fileMatch: RegExpExecArray | null;
               while ((fileMatch = fileRefRegex.exec(fullText)) !== null) {
@@ -726,7 +1025,9 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
                 const endLine1 = fileMatch[3] ? parseInt(fileMatch[3], 10) : startLine1;
 
                 const resolvedPath = resolveFilePath(rawPath);
-                if (!resolvedPath) continue;
+                if (!resolvedPath) {
+                  continue;
+                }
 
                 const startLine0 = startLine1 !== undefined ? Math.max(0, startLine1 - 1) : undefined;
                 const endLine0 = endLine1 !== undefined ? Math.max(0, endLine1 - 1) : startLine0;
@@ -743,23 +1044,27 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
                 });
               }
 
-              // Pattern 2: Node refs - [[Type:Name]] or [[graph:Type:Name]]
               const nodeRefRegex = new RegExp(NODE_REF_REGEX.source, NODE_REF_REGEX.flags);
               let nodeMatch: RegExpExecArray | null;
               while ((nodeMatch = nodeRefRegex.exec(fullText)) !== null) {
                 const nodeType = nodeMatch[1];
                 const nodeName = nodeMatch[2].trim();
 
-                // Find node in graph
-                if (!graph) continue;
+                if (!graph) {
+                  continue;
+                }
                 const node = graph.nodes.find(n =>
                   n.label === nodeType &&
                   n.properties.name === nodeName
                 );
-                if (!node || !node.properties.filePath) continue;
+                if (!node || !node.properties.filePath) {
+                  continue;
+                }
 
                 const resolvedPath = resolveFilePath(node.properties.filePath);
-                if (!resolvedPath) continue;
+                if (!resolvedPath) {
+                  continue;
+                }
 
                 addCodeReference({
                   filePath: resolvedPath,
@@ -778,13 +1083,15 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
             if (chunk.toolCall) {
               const tc = chunk.toolCall;
               toolCallsForMessage.push(tc);
-              // Add tool call as a step (in order with reasoning)
               stepsForMessage.push({
                 id: `step-${stepCounter++}`,
                 type: 'tool_call',
                 toolCall: tc,
               });
-              setCurrentToolCalls(prev => [...prev, tc]);
+              updateChatSessionRuntime(sessionId, current => ({
+                ...current,
+                currentToolCalls: [...current.currentToolCalls, tc],
+              }), requestId);
               scheduleMessageUpdate();
             }
             break;
@@ -792,7 +1099,6 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
           case 'tool_result':
             if (chunk.toolCall) {
               const tc = chunk.toolCall;
-              // Update the tool call status in toolCallsForMessage
               let idx = toolCallsForMessage.findIndex(t => t.id === tc.id);
               if (idx < 0) {
                 idx = toolCallsForMessage.findIndex(t => t.name === tc.name && t.status === 'running');
@@ -804,11 +1110,10 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
                 toolCallsForMessage[idx] = {
                   ...toolCallsForMessage[idx],
                   result: tc.result,
-                  status: 'completed'
+                  status: 'completed',
                 };
               }
 
-              // Also update the tool call in steps
               const stepIdx = stepsForMessage.findIndex(s =>
                 s.type === 'tool_call' && s.toolCall && (
                   s.toolCall.id === tc.id ||
@@ -826,27 +1131,33 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
                 };
               }
 
-              // Update currentToolCalls
-              setCurrentToolCalls(prev => {
-                let targetIdx = prev.findIndex(t => t.id === tc.id);
+              updateChatSessionRuntime(sessionId, current => {
+                let targetIdx = current.currentToolCalls.findIndex(t => t.id === tc.id);
                 if (targetIdx < 0) {
-                  targetIdx = prev.findIndex(t => t.name === tc.name && t.status === 'running');
+                  targetIdx = current.currentToolCalls.findIndex(t => t.name === tc.name && t.status === 'running');
                 }
                 if (targetIdx < 0) {
-                  targetIdx = prev.findIndex(t => t.name === tc.name && !t.result);
+                  targetIdx = current.currentToolCalls.findIndex(t => t.name === tc.name && !t.result);
                 }
-                if (targetIdx >= 0) {
-                  return prev.map((t, i) => i === targetIdx
-                    ? { ...t, result: tc.result, status: 'completed' }
-                    : t
-                  );
+                if (targetIdx < 0) {
+                  return current;
                 }
-                return prev;
-              });
+
+                return {
+                  ...current,
+                  currentToolCalls: current.currentToolCalls.map((toolCall, index) => index === targetIdx
+                    ? { ...toolCall, result: tc.result, status: 'completed' }
+                    : toolCall
+                  ),
+                };
+              }, requestId);
 
               scheduleMessageUpdate();
 
-              // Parse highlight marker from tool results
+              if (activeChatSessionIdRef.current !== sessionId) {
+                break;
+              }
+
               if (tc.result) {
                 const highlightMatch = tc.result.match(/\[HIGHLIGHT_NODES:([^\]]+)\]/);
                 if (highlightMatch) {
@@ -876,7 +1187,6 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
                   }
                 }
 
-                // Parse impact marker from tool results
                 const impactMatch = tc.result.match(/\[IMPACT:([^\]]+)\]/);
                 if (impactMatch) {
                   const rawIds = impactMatch[1].split(',').map((id: string) => id.trim()).filter(Boolean);
@@ -909,20 +1219,22 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
             break;
 
           case 'error':
-            setAgentError(chunk.error ?? 'Unknown error');
+            updateChatSessionRuntime(sessionId, current => ({
+              ...current,
+              error: chunk.error ?? 'Unknown error',
+            }), requestId);
             break;
 
           case 'done':
-            // Finalize the assistant message - just call updateMessage one more time
-            scheduleMessageUpdate();
+            scheduleMessageUpdate(true);
             break;
         }
-      });
+      };
 
-      // Stream agent response using the full streaming generator
-      // (handles reasoning, tool_call, tool_result, content, and done events)
       const agent = agentRef.current;
-      if (!agent) throw new Error('Agent not initialized');
+      if (!agent) {
+        throw new Error('Agent not initialized');
+      }
       const { streamAgentResponse } = await import('../core/llm/agent');
       for await (const chunk of streamAgentResponse(agent, history)) {
         onChunk(chunk);
@@ -930,26 +1242,138 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       onChunk({ type: 'done' });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setAgentError(message);
+      updateChatSessionRuntime(sessionId, current => ({
+        ...current,
+        error: message,
+      }), requestId);
     } finally {
-      setIsChatLoading(false);
-      setCurrentToolCalls([]);
+      updateChatSessionRuntime(sessionId, current => ({
+        ...current,
+        requestId: null,
+        isLoading: false,
+        currentToolCalls: [],
+      }), requestId);
     }
-  }, [chatMessages, isAgentReady, initializeAgent, resolveFilePath, findFileNodeId, addCodeReference, clearAICodeReferences, clearAIToolHighlights, graph, embeddingStatus]);
+  }, [
+    isAgentReady,
+    initializeAgent,
+    chatSessions,
+    resolveFilePath,
+    findFileNodeId,
+    addCodeReference,
+    clearAICodeReferences,
+    clearAIToolHighlights,
+    graph,
+    embeddingStatus,
+    updateChatSessionMessages,
+    updateChatSessionRuntime,
+    isSessionRequestCurrent,
+  ]);
+
+  const stopChatSession = useCallback((sessionId: string) => {
+    setChatSessionStates(prev => {
+      const current = prev[sessionId];
+      if (!current) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        [sessionId]: {
+          ...current,
+          requestId: null,
+          isLoading: false,
+          currentToolCalls: [],
+        },
+      };
+    });
+  }, []);
 
   const stopChatResponse = useCallback(() => {
-    if (isChatLoading) {
-      // Agent streaming will be interrupted by the AbortController in sendChatMessage
-      setIsChatLoading(false);
-      setCurrentToolCalls([]);
+    if (!activeChatSessionId) {
+      return;
     }
-  }, [isChatLoading]);
+    stopChatSession(activeChatSessionId);
+  }, [activeChatSessionId, stopChatSession]);
+
+  const createChatSession = useCallback(() => {
+    const newSession = createLocalChatSession(projectName || undefined);
+    setChatSessions(prev => [newSession, ...prev]);
+    setChatSessionStates(prev => ({
+      ...prev,
+      [newSession.id]: createChatSessionRuntimeState(),
+    }));
+    setActiveChatSessionId(newSession.id);
+  }, [projectName]);
+
+  const selectChatSession = useCallback((sessionId: string) => {
+    if (sessionId === activeChatSessionId) {
+      return;
+    }
+
+    const nextSession = chatSessions.find(session => session.id === sessionId);
+    if (!nextSession) {
+      return;
+    }
+
+    setActiveChatSessionId(nextSession.id);
+  }, [activeChatSessionId, chatSessions]);
+
+  const deleteChatSession = useCallback((sessionId: string) => {
+    const targetSession = chatSessions.find(session => session.id === sessionId);
+    if (!targetSession) {
+      return;
+    }
+
+    stopChatSession(sessionId);
+
+    const remainingSessions = chatSessions.filter(session => session.id !== sessionId);
+    if (remainingSessions.length === 0) {
+      const replacementSession = createLocalChatSession(projectName || targetSession.projectName);
+      setChatSessions([replacementSession]);
+      setChatSessionStates({
+        [replacementSession.id]: createChatSessionRuntimeState(),
+      });
+      setActiveChatSessionId(replacementSession.id);
+      return;
+    }
+
+    setChatSessions(remainingSessions);
+    setChatSessionStates(prev => {
+      const { [sessionId]: _removed, ...rest } = prev;
+      return rest;
+    });
+    if (sessionId === activeChatSessionId) {
+      const [nextSession] = [...remainingSessions].sort((a, b) => b.updatedAt - a.updatedAt);
+      setActiveChatSessionId(nextSession.id);
+    }
+  }, [activeChatSessionId, chatSessions, projectName, stopChatSession]);
 
   const clearChat = useCallback(() => {
-    setChatMessages([]);
-    setCurrentToolCalls([]);
-    setAgentError(null);
-  }, []);
+    if (!activeChatSessionId) {
+      return;
+    }
+
+    stopChatSession(activeChatSessionId);
+    updateChatSessionMessages(activeChatSessionId, () => [], { touchUpdatedAt: true });
+    setChatSessionStates(prev => {
+      const current = prev[activeChatSessionId];
+      if (!current) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        [activeChatSessionId]: {
+          ...current,
+          requestId: null,
+          isLoading: false,
+          currentToolCalls: [],
+          error: null,
+        },
+      };
+    });
+  }, [activeChatSessionId, stopChatSession, updateChatSessionMessages]);
 
   // Switch to a different repo on the connected server
   const switchRepo = useCallback(async (repoName: string) => {
@@ -1009,7 +1433,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
         console.warn('Failed to initialize agent:', err);
         setIsAgentReady(false);
         agentRef.current = null;
-        setAgentError('Failed to initialize agent');
+        setAgentStatusError('Failed to initialize agent');
         setViewMode('exploring');
         setProgress(null);
       }
@@ -1125,6 +1549,9 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
     isAgentInitializing,
     agentError,
     // Chat state
+    chatSessions,
+    chatSessionStates,
+    activeChatSessionId,
     chatMessages,
     isChatLoading,
     currentToolCalls,
@@ -1133,6 +1560,9 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
     initializeAgent,
     sendChatMessage,
     stopChatResponse,
+    createChatSession,
+    selectChatSession,
+    deleteChatSession,
     clearChat,
     // Code References Panel
     codeReferences,
@@ -1159,4 +1589,3 @@ export const useAppState = (): AppState => {
   }
   return context;
 };
-

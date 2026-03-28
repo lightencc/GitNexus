@@ -212,6 +212,29 @@ export interface ChatMessage {
 }
 
 /**
+ * Persisted local chat session
+ */
+export interface ChatSession {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: number;
+  updatedAt: number;
+  projectName?: string;
+}
+
+/**
+ * Ephemeral runtime state for a chat session
+ * Not persisted to localStorage.
+ */
+export interface ChatSessionState {
+  requestId: string | null;
+  isLoading: boolean;
+  currentToolCalls: ToolCallInfo[];
+  error: string | null;
+}
+
+/**
  * Tool call information for UI display
  */
 export interface ToolCallInfo {
@@ -380,4 +403,3 @@ NOTES:
 - For vector search, join CodeEmbedding.nodeId to the appropriate table's id
 - Use LIMIT to avoid returning too many results
 `;
-

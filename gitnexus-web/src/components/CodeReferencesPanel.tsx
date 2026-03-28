@@ -256,7 +256,7 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
         <button
           onClick={() => setIsCollapsed(false)}
           className="p-2 text-text-secondary hover:text-cyan-400 hover:bg-cyan-500/10 rounded transition-colors"
-          title="Expand Code Panel"
+          title="Expand Detail Panel"
         >
           <PanelLeft className="w-5 h-5" />
         </button>
@@ -291,7 +291,7 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
       <div className="flex items-center justify-between px-3 py-2.5 border-b border-border-subtle bg-gradient-to-r from-elevated/60 to-surface/60">
         <div className="flex items-center gap-2">
           <Code className="w-4 h-4 text-cyan-400" />
-          <span className="text-sm font-semibold text-text-primary">Code Inspector</span>
+          <span className="text-sm font-semibold text-text-primary">Record Detail</span>
         </div>
         <div className="flex items-center gap-1.5">
           {showCitations && (
@@ -377,9 +377,9 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
               ) : (
                 <div className="px-3 py-3 text-sm text-text-muted">
                   {selectedIsFile ? (
-                    <>Code not available in memory for <span className="font-mono">{selectedFilePath}</span></>
+                    <>Detail not available in memory for <span className="font-mono">{selectedFilePath}</span></>
                   ) : (
-                    <>Select a file node to preview its contents.</>
+                    <>Select a record or file node to preview its details.</>
                   )}
                 </div>
               )}
@@ -507,11 +507,11 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
                   >
                     {content}
                   </SyntaxHighlighter>
-                ) : (
-                  <div className="px-3 py-3 text-sm text-text-muted">
-                    Code not available in memory for <span className="font-mono">{ref.filePath}</span>
-                  </div>
-                )}
+                  ) : (
+                    <div className="px-3 py-3 text-sm text-text-muted">
+                      Detail not available in memory for <span className="font-mono">{ref.filePath}</span>
+                    </div>
+                  )}
               </div>
             </div>
           );
